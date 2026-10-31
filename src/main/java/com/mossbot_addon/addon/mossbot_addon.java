@@ -32,6 +32,7 @@ public class mossbot_addon extends MeteorAddon {
     public void onInitialize() {
         LOG.info("Initializing Moss Boss by JerkinOffInMyCar");
 
+        // Safely register modules, commands, and HUD elements here where Modules.get() is fully available
         Modules.get().add(new MossBot());
         Commands.add(new MossBotCommands());
         Hud.get().register(MossBotHUD.INFO);

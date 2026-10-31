@@ -1,21 +1,25 @@
 {
   "schemaVersion": 1,
-  "id": "auto-moss-bot",
-  "version": "0.1",
+  "id": "moss-boss",
+  "version": "${version}",
   "name": "Moss Boss",
-  "description": "Auto Moss Bot addon for Meteor Client",
-  "authors": ["JerkinOffInMyCar"],
+  "description": "Automatically expands moss and safely grows azalea trees",
+  "authors": [
+    "JerkinOffInMyCar"
+  ],
   "contact": {},
   "license": "MIT",
-  "environment": "*",
+  "environment": "client",
   "entrypoints": {
     "meteor": [
       "com.mossbot_addon.addon.mossbot_addon"
     ]
   },
+  "mixins": [],
   "depends": {
-    "fabricloader": ">=0.18.2",
-    "minecraft": "~1.21.11",
-    "java": ">=21"
+    "fabricloader": ">=0.15.0",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "meteor-client": "*"
   }
 }
