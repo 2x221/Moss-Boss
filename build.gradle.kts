@@ -12,6 +12,10 @@ base {
 }
 
 repositories {
+    // Tells Loom to treat your local 'libs' folder as a real Maven repo so it remaps the jar properly!
+    flatDir {
+        dirs("libs")
+    }
     maven { url = uri("https://maven.meteordev.org/releases") }
     maven { url = uri("https://maven.meteordev.org/snapshots") }
     maven { url = uri("https://maven.fabricmc.net/") }
@@ -39,11 +43,11 @@ dependencies {
     // Discord IPC library required by Meteor's Rich Presence module
     implementation("meteordevelopment:discord-ipc:1.1")
 
-    // Local Meteor Client jar (Required for compilation)
-    modImplementation(files("libs/meteor-client-1.21.11-86.jar"))
+    // Loaded via flatDir so Fabric Loom remaps Minecraft classes inside Meteor properly
+    modImplementation("meteordevelopment:meteor-client:1.21.11-86")
 
-    // Baritone API/Mod dependency
-    modImplementation("com.github.cabaletta:baritone:1.10.1")
+    // Baritone API/Mod dependency (use modCompileOnly if you don't have Baritone installed in your live mods folder!)
+    modCompileOnly("com.github.cabaletta:baritone:1.10.1")
 }
 
 tasks.processResources {

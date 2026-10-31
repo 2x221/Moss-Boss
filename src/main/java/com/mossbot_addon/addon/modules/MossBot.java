@@ -11,6 +11,7 @@ import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -24,7 +25,6 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.LightType;
 
-import java.lang.reflect.Field;
 import java.util.*;
 
 public class MossBot extends Module {
@@ -273,17 +273,6 @@ public class MossBot extends Module {
             "moss-bot",
             "Automatically expands moss and safely grows azalea trees"
         );
-
-        if (this.color != null) {
-            this.color.set(mossbot_addon.ADDON_COLOR);
-        }
-
-        try {
-            Field addonField = Module.class.getDeclaredField("addon");
-            addonField.setAccessible(true);
-            addonField.set(this, null);
-        } catch (Exception ignored) {
-        }
     }
 
     @Override
@@ -481,17 +470,18 @@ public class MossBot extends Module {
     }
 
     private boolean tryUnstuckPlayer() {
-        if (mc.player == null || mc.world == null) return false;
+        ClientWorld world = mc.world;
+        if (mc.player == null || world == null) return false;
 
         BlockPos feetPos = mc.player.getBlockPos();
         BlockPos headPos = feetPos.up();
 
         // 1. Immediate priority: Break any tree/foliage block directly inside the player's hitbox (head or feet)
-        if (isTrappingTreeBlock(mc.world.getBlockState(headPos))) {
+        if (isTrappingTreeBlock(world.getBlockState(headPos))) {
             BlockUtils.breakBlock(headPos, true);
             return true;
         }
-        if (isTrappingTreeBlock(mc.world.getBlockState(feetPos))) {
+        if (isTrappingTreeBlock(world.getBlockState(feetPos))) {
             BlockUtils.breakBlock(feetPos, true);
             return true;
         }
@@ -504,8 +494,8 @@ public class MossBot extends Module {
         for (Direction dir : horizDirs) {
             BlockPos adjFeet = feetPos.offset(dir);
             BlockPos adjHead = headPos.offset(dir);
-            BlockState feetState = mc.world.getBlockState(adjFeet);
-            BlockState headState = mc.world.getBlockState(adjHead);
+            BlockState feetState = world.getBlockState(adjFeet);
+            BlockState headState = world.getBlockState(adjHead);
 
             boolean feetBlocked = isBlockingMovement(feetState, adjFeet);
             boolean headBlocked = isBlockingMovement(headState, adjHead);
@@ -525,8 +515,8 @@ public class MossBot extends Module {
         Direction lookDir = mc.player.getHorizontalFacing();
         BlockPos frontHead = headPos.offset(lookDir);
         BlockPos frontFeet = feetPos.offset(lookDir);
-        boolean frontTrappedByTree = isTrappingTreeBlock(mc.world.getBlockState(frontHead))
-            || isTrappingTreeBlock(mc.world.getBlockState(frontFeet));
+        boolean frontTrappedByTree = isTrappingTreeBlock(world.getBlockState(frontHead))
+            || isTrappingTreeBlock(world.getBlockState(frontFeet));
 
         if ((blockedSides >= 3 || (frontTrappedByTree && mc.player.input != null && mc.player.input.hasForwardMovement()))
             && !candidateObstacles.isEmpty()) {
@@ -536,11 +526,11 @@ public class MossBot extends Module {
 
             // Sort obstacles so fast-break blocks (leaves/carpets) and blocks in front of the player are broken first
             candidateObstacles.sort(
-                Comparator.comparingInt((BlockPos p) -> getBreakPriority(mc.world.getBlockState(p)))
+                Comparator.comparingInt((BlockPos p) -> getBreakPriority(world.getBlockState(p)))
                     .thenComparingDouble(p -> rayDistSq(eyePos, lookVec, Vec3d.ofCenter(p)))
             );
 
-            BlockUtils.breakBlock(candidateObstacles.get(0), true);
+            BlockUtils.breakBlock(candidateObstacles.getFirst(), true);
             return true;
         }
 
