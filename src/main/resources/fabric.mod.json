@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "moss-boss",
   "version": "${version}",
-  "name": "Moss Boss",
+  "name": "JerkinOffInMyCar",
   "description": "Automatically expands moss and safely grows azalea trees",
   "authors": [
     "JerkinOffInMyCar"

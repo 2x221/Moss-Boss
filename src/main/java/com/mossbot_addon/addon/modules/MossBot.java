@@ -4,6 +4,7 @@ import com.mossbot_addon.addon.mossbot_addon;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
@@ -11,10 +12,13 @@ import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.component.DataComponentTypes;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.item.consume.UseAction;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
@@ -49,7 +53,7 @@ public class MossBot extends Module {
         Blocks.WAXED_OXIDIZED_COPPER_BULB
     );
 
-    private static final Set<Block> CONVERTIBLE_BLOCKS = Set.of(
+    public static final Set<Block> CONVERTIBLE_BLOCKS = Set.of(
         Blocks.STONE,
         Blocks.DEEPSLATE,
         Blocks.GRANITE,
@@ -76,8 +80,8 @@ public class MossBot extends Module {
 
     private final Setting<Double> range = sgGeneral.add(new DoubleSetting.Builder()
         .name("moss-range")
-        .description("Maximum reach range for moss spreading.")
-        .defaultValue(4.5)
+        .description("Reach range for moss.")
+        .defaultValue(5.0)
         .min(1.0)
         .max(6.0)
         .sliderMin(1.0)
@@ -96,8 +100,8 @@ public class MossBot extends Module {
 
     private final Setting<Integer> actionsPerTick = sgGeneral.add(new IntSetting.Builder()
         .name("actions-per-tick")
-        .description("How many moss actions to perform per tick.")
-        .defaultValue(1)
+        .description("Blocks to bonemeal per tick.")
+        .defaultValue(4)
         .min(1)
         .max(10)
         .sliderMin(1)
@@ -107,8 +111,8 @@ public class MossBot extends Module {
 
     private final Setting<Integer> fovAngle = sgGeneral.add(new IntSetting.Builder()
         .name("fov-angle")
-        .description("Maximum angle from your crosshair to target blocks.")
-        .defaultValue(80)
+        .description("Max angle from crosshair.")
+        .defaultValue(180)
         .min(15)
         .max(180)
         .sliderMin(15)
@@ -118,37 +122,42 @@ public class MossBot extends Module {
 
     private final Setting<Boolean> breakGrass = sgGeneral.add(new BoolSetting.Builder()
         .name("break-grass")
-        .description("Automatically break grass and vegetation spawned on moss.")
+        .description("Break grass on top of moss.")
         .defaultValue(true)
         .build()
     );
 
     private final Setting<Boolean> rotate = sgGeneral.add(new BoolSetting.Builder()
         .name("rotate")
-        .description("Automatically rotate towards the target block.")
-        .defaultValue(true)
-        .build()
-    );
-
-    // Seed Starter Settings
-    private final Setting<Boolean> autoPlaceSeed = sgSeed.add(new BoolSetting.Builder()
-        .name("auto-place-seed")
-        .description("Automatically place a moss block on stone/dirt if no moss is nearby to kickstart spreading.")
+        .description("Rotate towards target block.")
         .defaultValue(false)
         .build()
     );
 
-    // Azalea Controls
+    private final Setting<Boolean> pauseOnEat = sgGeneral.add(new BoolSetting.Builder()
+        .name("pause-on-eat")
+        .description("Pause while eating.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> autoPlaceSeed = sgSeed.add(new BoolSetting.Builder()
+        .name("auto-place-seed")
+        .description("Place a moss block if none are nearby.")
+        .defaultValue(true)
+        .build()
+    );
+
     private final Setting<Boolean> bonemealAzalea = sgAzalea.add(new BoolSetting.Builder()
         .name("enable-azalea-spreading")
-        .description("Enable automatic azalea tree bonemealing.")
+        .description("Bonemeal azalea bushes into trees.")
         .defaultValue(false)
         .build()
     );
 
     private final Setting<AzaleaMode> azaleaMode = sgAzalea.add(new EnumSetting.Builder<AzaleaMode>()
         .name("azalea-mode")
-        .description("SafeSpread targets behind/beside you. FastSpread targets all around with reduced front aggression.")
+        .description("Tree growth mode.")
         .defaultValue(AzaleaMode.SafeSpread)
         .visible(bonemealAzalea::get)
         .build()
@@ -156,7 +165,7 @@ public class MossBot extends Module {
 
     private final Setting<Double> azaleaRange = sgAzalea.add(new DoubleSetting.Builder()
         .name("azalea-range")
-        .description("Maximum reach range for azalea bonemealing.")
+        .description("Reach range for azaleas.")
         .defaultValue(6.0)
         .min(1.0)
         .max(6.0)
@@ -168,7 +177,7 @@ public class MossBot extends Module {
 
     private final Setting<Integer> azaleasPerTick = sgAzalea.add(new IntSetting.Builder()
         .name("azaleas-per-tick")
-        .description("Maximum azaleas to bonemeal per tick.")
+        .description("Azaleas to bonemeal per tick.")
         .defaultValue(1)
         .min(1)
         .max(5)
@@ -180,23 +189,22 @@ public class MossBot extends Module {
 
     private final Setting<Boolean> autoUnstuck = sgAzalea.add(new BoolSetting.Builder()
         .name("auto-unstuck")
-        .description("Automatically breaks tree leaves and logs trapping the player after bonemealing an azalea.")
+        .description("Break leaves and logs if trapped by a tree.")
         .defaultValue(true)
         .visible(bonemealAzalea::get)
         .build()
     );
 
-    // Auto Crafting Settings
     private final Setting<Boolean> craftBoneBlocks = sgCrafting.add(new BoolSetting.Builder()
         .name("craft-bone-blocks")
-        .description("Automatically craft bone blocks into bone meal when space allows.")
+        .description("Craft bone blocks into bone meal.")
         .defaultValue(true)
         .build()
     );
 
     private final Setting<Integer> craftBlocksPerTick = sgCrafting.add(new IntSetting.Builder()
         .name("craft-blocks-per-tick")
-        .description("Maximum number of bone blocks to convert into bone meal per craft cycle.")
+        .description("Bone blocks to craft per cycle.")
         .defaultValue(4)
         .min(1)
         .max(64)
@@ -207,7 +215,7 @@ public class MossBot extends Module {
 
     private final Setting<Integer> craftLimitPercent = sgCrafting.add(new IntSetting.Builder()
         .name("craft-limit-percent")
-        .description("Percentage of available inventory space allowed to be filled with bone meal.")
+        .description("Max inventory space to fill with bone meal.")
         .defaultValue(50)
         .min(1)
         .max(100)
@@ -216,17 +224,16 @@ public class MossBot extends Module {
         .build()
     );
 
-    // Spawn Proofing Settings
     private final Setting<Boolean> spawnProof = sgLighting.add(new BoolSetting.Builder()
         .name("spawn-proof")
-        .description("Automatically place full light blocks to light up dark surrounding areas.")
+        .description("Place light blocks on dark spots.")
         .defaultValue(false)
         .build()
     );
 
     private final Setting<Integer> maxBlockLight = sgLighting.add(new IntSetting.Builder()
         .name("max-block-light")
-        .description("Place a light block when floor block light level is at or below this value.")
+        .description("Place light when block light is at or below this value.")
         .defaultValue(0)
         .min(0)
         .max(14)
@@ -238,7 +245,7 @@ public class MossBot extends Module {
 
     private final Setting<Boolean> lightWhitelistMode = sgLighting.add(new BoolSetting.Builder()
         .name("light-whitelist-mode")
-        .description("Only use the light blocks selected in the whitelist below.")
+        .description("Only use light blocks from the whitelist.")
         .defaultValue(false)
         .visible(spawnProof::get)
         .build()
@@ -246,7 +253,7 @@ public class MossBot extends Module {
 
     private final Setting<List<Block>> lightWhitelist = sgLighting.add(new BlockListSetting.Builder()
         .name("light-whitelist")
-        .description("Select which full light blocks are allowed to be placed.")
+        .description("Allowed light blocks.")
         .defaultValue(
             Blocks.GLOWSTONE,
             Blocks.SEA_LANTERN,
@@ -263,6 +270,7 @@ public class MossBot extends Module {
 
     private int timer = 0;
     private int craftCooldown = 0;
+    private int seedCooldown = 0;
     private boolean pendingCraftCollect = false;
     private int pendingCraftTimeout = 0;
     private final Map<BlockPos, Integer> recentBonemealed = new HashMap<>();
@@ -282,6 +290,22 @@ public class MossBot extends Module {
         recentBonemealed.clear();
     }
 
+    public static boolean isEating(MinecraftClient mc) {
+        if (mc.player == null) return false;
+        if (mc.player.isUsingItem() && isFood(mc.player.getActiveItem())) return true;
+        if (mc.options.useKey.isPressed()) {
+            return isFood(mc.player.getMainHandStack()) || isFood(mc.player.getOffHandStack());
+        }
+        return false;
+    }
+
+    private static boolean isFood(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        if (stack.get(DataComponentTypes.FOOD) != null || stack.get(DataComponentTypes.CONSUMABLE) != null) return true;
+        UseAction action = stack.getUseAction();
+        return action == UseAction.EAT || action == UseAction.DRINK;
+    }
+
     @EventHandler
     @SuppressWarnings("unused")
     public void onTick(TickEvent.Pre event) {
@@ -294,17 +318,20 @@ public class MossBot extends Module {
             });
         }
 
-        if (craftCooldown > 0) craftCooldown--;
+        if (pauseOnEat.get() && isEating(mc)) return;
 
-        if (craftBoneBlocks.get()) {
+        if (craftCooldown > 0) craftCooldown--;
+        if (seedCooldown > 0) seedCooldown--;
+
+        MossPilot pilot = Modules.get().get(MossPilot.class);
+        boolean pilotActive = pilot != null && pilot.isActive();
+
+        if (craftBoneBlocks.get() || pilotActive) {
             handleBoneMealCrafting();
         }
 
-        // Priority 1: If trapped by an azalea tree, break out immediately (targeting leaves first)
         if (bonemealAzalea.get() && autoUnstuck.get()) {
-            if (tryUnstuckPlayer()) {
-                return;
-            }
+            if (tryUnstuckPlayer()) return;
         }
 
         if (spawnProof.get()) {
@@ -312,9 +339,10 @@ public class MossBot extends Module {
         }
 
         BlockPos playerPos = mc.player.getBlockPos();
-        double maxR = Math.max(range.get(), bonemealAzalea.get() ? azaleaRange.get() : range.get());
+        double effectiveMossRange = pilotActive ? Math.max(range.get(), 5.0) : range.get();
+        double maxR = Math.max(effectiveMossRange, bonemealAzalea.get() ? azaleaRange.get() : effectiveMossRange);
         int searchRadius = (int) Math.ceil(maxR);
-        double rangeSq = range.get() * range.get();
+        double rangeSq = effectiveMossRange * effectiveMossRange;
         double azaleaRangeSq = bonemealAzalea.get() ? azaleaRange.get() * azaleaRange.get() : 0;
         Vec3d eyePos = mc.player.getEyePos();
         Vec3d lookVec = mc.player.getRotationVec(1.0F).normalize();
@@ -334,23 +362,42 @@ public class MossBot extends Module {
 
             BlockState state = mc.world.getBlockState(pos);
             boolean isMoss = state.isOf(Blocks.MOSS_BLOCK);
-            BlockPos immutablePos = pos.toImmutable();
-
-            if (isMoss && distSq <= rangeSq && hasConvertibleNeighbor(immutablePos)) {
-                hasExpandableMossNearby = true;
-            }
-
-            if (recentBonemealed.containsKey(immutablePos)) continue;
-
-            Vec3d toBlock = center.subtract(eyePos).normalize();
-            double dot = lookVec.dotProduct(toBlock);
-            if (fovAngle.get() < 180 && dot < minCosAngle) continue;
-
             boolean isAzalea = bonemealAzalea.get() && (state.isOf(Blocks.AZALEA) || state.isOf(Blocks.FLOWERING_AZALEA));
 
             if (!isMoss && !isAzalea) continue;
 
-            if (isAzalea) {
+            BlockPos immutablePos = pos.toImmutable();
+
+            if (isMoss && distSq <= rangeSq) {
+                int convScore = countConvertibleNeighbors(immutablePos);
+                if (convScore > 0) {
+                    hasExpandableMossNearby = true;
+
+                    if (!recentBonemealed.containsKey(immutablePos)) {
+                        if (!pilotActive && fovAngle.get() < 180) {
+                            Vec3d toBlock = center.subtract(eyePos).normalize();
+                            if (lookVec.dotProduct(toBlock) < minCosAngle) continue;
+                        }
+
+                        BlockPos abovePos = immutablePos.up();
+                        BlockState aboveState = mc.world.getBlockState(abovePos);
+                        boolean hasGrassAbove = isBreakableVegetation(aboveState);
+
+                        if (aboveState.isAir() || (breakGrass.get() && hasGrassAbove)) {
+                            double score = distSq - (convScore * 2.0);
+                            mossCandidates.add(new TargetCandidate(immutablePos, hasGrassAbove, score));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (isAzalea && !recentBonemealed.containsKey(immutablePos)) {
+                if (!pilotActive && fovAngle.get() < 180) {
+                    Vec3d toBlock = center.subtract(eyePos).normalize();
+                    if (lookVec.dotProduct(toBlock) < minCosAngle) continue;
+                }
+
                 if (distSq <= azaleaRangeSq && hasAzaleaGrowthSpace(immutablePos)) {
                     Vec3d playerLook2D = new Vec3d(lookVec.x, 0, lookVec.z).normalize();
                     Vec3d toAzalea2D = new Vec3d(center.x - eyePos.x, 0, center.z - eyePos.z).normalize();
@@ -367,31 +414,15 @@ public class MossBot extends Module {
                         }
                     }
                 }
-                continue;
             }
-
-            if (distSq > rangeSq) continue;
-
-            // Strict Spreading Check: Only target moss if it can actually expand outward
-            if (!hasConvertibleNeighbor(immutablePos)) {
-                continue;
-            }
-
-            BlockPos abovePos = immutablePos.up();
-            BlockState aboveState = mc.world.getBlockState(abovePos);
-            boolean hasGrassAbove = isBreakableVegetation(aboveState);
-
-            if (!aboveState.isAir() && !(breakGrass.get() && hasGrassAbove)) {
-                continue;
-            }
-
-            double rayDistSq = rayDistSq(eyePos, lookVec, center);
-            mossCandidates.add(new TargetCandidate(immutablePos, hasGrassAbove, rayDistSq));
         }
 
-        // If no expandable moss is nearby and Auto Seed Starter is enabled, place a seed moss block
-        if (!hasExpandableMossNearby && autoPlaceSeed.get()) {
-            tryPlaceSeedMoss(playerPos, rangeSq, eyePos, lookVec, minCosAngle);
+        if (!hasExpandableMossNearby && (autoPlaceSeed.get() || pilotActive) && seedCooldown == 0) {
+            BlockPos seeded = tryPlaceSeedMoss(playerPos, rangeSq, eyePos, lookVec, minCosAngle, pilotActive);
+            if (seeded != null) {
+                mossCandidates.add(new TargetCandidate(seeded, false, -100.0));
+                seedCooldown = 3;
+            }
         }
 
         FindItemResult bonemeal = getAvailableBonemeal();
@@ -403,25 +434,32 @@ public class MossBot extends Module {
         }
 
         int actionsDone = 0;
-        int maxActions = actionsPerTick.get();
+        int maxActions = pilotActive ? Math.max(actionsPerTick.get(), 4) : actionsPerTick.get();
 
-        // 1. Process Moss Spreading
         if (!mossCandidates.isEmpty()) {
             mossCandidates.sort(Comparator.comparingDouble(c -> c.rayDistSq));
 
+            boolean swapped = false;
             for (TargetCandidate candidate : mossCandidates) {
                 if (actionsDone >= maxActions) break;
 
                 if (breakGrass.get() && candidate.hasGrassAbove) {
                     BlockPos abovePos = candidate.pos.up();
                     if (mc.player.squaredDistanceTo(Vec3d.ofCenter(abovePos)) <= rangeSq) {
+                        if (swapped) {
+                            InvUtils.swapBack();
+                            swapped = false;
+                        }
                         BlockUtils.breakBlock(abovePos, true);
                         actionsDone++;
                         continue;
                     }
                 }
 
-                InvUtils.swap(bonemeal.slot(), true);
+                if (!swapped) {
+                    InvUtils.swap(bonemeal.slot(), true);
+                    swapped = true;
+                }
 
                 BlockHitResult hitResult = new BlockHitResult(
                     Vec3d.ofCenter(candidate.pos),
@@ -430,24 +468,24 @@ public class MossBot extends Module {
                     false
                 );
 
-                BlockUtils.interact(hitResult, Hand.MAIN_HAND, rotate.get());
-                InvUtils.swapBack();
-
-                recentBonemealed.put(candidate.pos, 15);
+                BlockUtils.interact(hitResult, Hand.MAIN_HAND, rotate.get() && actionsDone == 0);
+                recentBonemealed.put(candidate.pos, 7);
                 actionsDone++;
+            }
+
+            if (swapped) {
+                InvUtils.swapBack();
             }
         }
 
-        // 2. Process Azaleas
         int azaleasDone = 0;
         int maxAzaleas = azaleasPerTick.get();
         if (!azaleaCandidates.isEmpty()) {
             azaleaCandidates.sort(Comparator.comparingDouble(c -> c.rayDistSq));
 
+            InvUtils.swap(bonemeal.slot(), true);
             for (TargetCandidate candidate : azaleaCandidates) {
                 if (azaleasDone >= maxAzaleas) break;
-
-                InvUtils.swap(bonemeal.slot(), true);
 
                 BlockHitResult hitResult = new BlockHitResult(
                     Vec3d.ofCenter(candidate.pos),
@@ -456,12 +494,11 @@ public class MossBot extends Module {
                     false
                 );
 
-                BlockUtils.interact(hitResult, Hand.MAIN_HAND, rotate.get());
-                InvUtils.swapBack();
-
-                recentBonemealed.put(candidate.pos, 25);
+                BlockUtils.interact(hitResult, Hand.MAIN_HAND, rotate.get() && azaleasDone == 0);
+                recentBonemealed.put(candidate.pos, 20);
                 azaleasDone++;
             }
+            InvUtils.swapBack();
         }
 
         if (actionsDone > 0 || azaleasDone > 0) {
@@ -476,7 +513,6 @@ public class MossBot extends Module {
         BlockPos feetPos = mc.player.getBlockPos();
         BlockPos headPos = feetPos.up();
 
-        // 1. Immediate priority: Break any tree/foliage block directly inside the player's hitbox (head or feet)
         if (isTrappingTreeBlock(world.getBlockState(headPos))) {
             BlockUtils.breakBlock(headPos, true);
             return true;
@@ -486,7 +522,6 @@ public class MossBot extends Module {
             return true;
         }
 
-        // 2. Check the 4 horizontal directions around the player to see if they are boxed in
         Direction[] horizDirs = new Direction[]{Direction.NORTH, Direction.SOUTH, Direction.EAST, Direction.WEST};
         int blockedSides = 0;
         List<BlockPos> candidateObstacles = new ArrayList<>();
@@ -511,7 +546,6 @@ public class MossBot extends Module {
             }
         }
 
-        // Also check if the block directly in front of the player's movement/look direction is blocked by tree foliage
         Direction lookDir = mc.player.getHorizontalFacing();
         BlockPos frontHead = headPos.offset(lookDir);
         BlockPos frontFeet = feetPos.offset(lookDir);
@@ -524,7 +558,6 @@ public class MossBot extends Module {
             Vec3d eyePos = mc.player.getEyePos();
             Vec3d lookVec = mc.player.getRotationVec(1.0F).normalize();
 
-            // Sort obstacles so fast-break blocks (leaves/carpets) and blocks in front of the player are broken first
             candidateObstacles.sort(
                 Comparator.comparingInt((BlockPos p) -> getBreakPriority(world.getBlockState(p)))
                     .thenComparingDouble(p -> rayDistSq(eyePos, lookVec, Vec3d.ofCenter(p)))
@@ -555,7 +588,6 @@ public class MossBot extends Module {
     }
 
     private int getBreakPriority(BlockState state) {
-        // 0 = Instant break (carpets/bushes), 1 = Fast break (leaves), 2 = Slower break (logs)
         if (state.isOf(Blocks.MOSS_CARPET) || state.isOf(Blocks.AZALEA) || state.isOf(Blocks.FLOWERING_AZALEA)) {
             return 0;
         }
@@ -565,7 +597,7 @@ public class MossBot extends Module {
         return 2;
     }
 
-    private void tryPlaceSeedMoss(BlockPos playerPos, double rangeSq, Vec3d eyePos, Vec3d lookVec, double minCosAngle) {
+    private BlockPos tryPlaceSeedMoss(BlockPos playerPos, double rangeSq, Vec3d eyePos, Vec3d lookVec, double minCosAngle, boolean ignoreFov) {
         FindItemResult mossBlock = InvUtils.findInHotbar(Items.MOSS_BLOCK);
         if (!mossBlock.found()) {
             FindItemResult invMoss = InvUtils.find(Items.MOSS_BLOCK);
@@ -574,11 +606,11 @@ public class MossBot extends Module {
                 mossBlock = InvUtils.findInHotbar(Items.MOSS_BLOCK);
             }
         }
-        if (!mossBlock.found()) return;
+        if (!mossBlock.found()) return null;
 
         int searchRadius = (int) Math.ceil(Math.sqrt(rangeSq));
         BlockPos bestPlacePos = null;
-        double closestRayDist = Double.MAX_VALUE;
+        double bestScore = Double.MAX_VALUE;
 
         for (BlockPos pos : BlockPos.iterate(
             playerPos.add(-searchRadius, -searchRadius, -searchRadius),
@@ -589,9 +621,10 @@ public class MossBot extends Module {
             double distSq = eyePos.squaredDistanceTo(center);
             if (distSq > rangeSq) continue;
 
-            Vec3d toBlock = center.subtract(eyePos).normalize();
-            double dot = lookVec.dotProduct(toBlock);
-            if (fovAngle.get() < 180 && dot < minCosAngle) continue;
+            if (!ignoreFov && fovAngle.get() < 180) {
+                Vec3d toBlock = center.subtract(eyePos).normalize();
+                if (lookVec.dotProduct(toBlock) < minCosAngle) continue;
+            }
 
             BlockState state = mc.world.getBlockState(pos);
             BlockPos placePos = pos.up().toImmutable();
@@ -600,10 +633,11 @@ public class MossBot extends Module {
                 && mc.world.getBlockState(placePos).isAir()
                 && BlockUtils.canPlace(placePos, true)) {
 
-                if (hasConvertibleNeighbor(placePos)) {
-                    double rayDist = rayDistSq(eyePos, lookVec, center);
-                    if (rayDist < closestRayDist) {
-                        closestRayDist = rayDist;
+                int neighbors = countConvertibleNeighbors(pos);
+                if (neighbors >= 2) {
+                    double score = distSq - (neighbors * 2.0);
+                    if (score < bestScore) {
+                        bestScore = score;
                         bestPlacePos = placePos;
                     }
                 }
@@ -611,8 +645,11 @@ public class MossBot extends Module {
         }
 
         if (bestPlacePos != null) {
-            BlockUtils.place(bestPlacePos, mossBlock, rotate.get(), 50, true);
+            if (BlockUtils.place(bestPlacePos, mossBlock, rotate.get(), 50, true)) {
+                return bestPlacePos;
+            }
         }
+        return null;
     }
 
     private double rayDistSq(Vec3d eyePos, Vec3d lookVec, Vec3d center) {
@@ -628,24 +665,25 @@ public class MossBot extends Module {
             || state.isOf(Blocks.LARGE_FERN);
     }
 
-    private boolean hasConvertibleNeighbor(BlockPos mossPos) {
-        if (mc.world == null) return false;
-        // Require at least 2 convertible surface blocks in a 3x3 horizontal neighborhood so single isolated blocks aren't spammed
+    public int countConvertibleNeighbors(BlockPos mossPos) {
+        if (mc.world == null) return 0;
         int convertibleCount = 0;
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
                 if (dx == 0 && dz == 0) continue;
-                for (int dy = -1; dy <= 1; dy++) {
+                for (int dy = -2; dy <= 1; dy++) {
                     BlockPos checkPos = mossPos.add(dx, dy, dz);
-                    if (CONVERTIBLE_BLOCKS.contains(mc.world.getBlockState(checkPos).getBlock())
-                        && mc.world.getBlockState(checkPos.up()).isAir()) {
-                        convertibleCount++;
-                        if (convertibleCount >= 2) return true;
+                    if (CONVERTIBLE_BLOCKS.contains(mc.world.getBlockState(checkPos).getBlock())) {
+                        BlockState above = mc.world.getBlockState(checkPos.up());
+                        if (above.isAir() || isBreakableVegetation(above)) {
+                            convertibleCount++;
+                            if (convertibleCount >= 6) return convertibleCount;
+                        }
                     }
                 }
             }
         }
-        return false;
+        return convertibleCount;
     }
 
     private boolean hasAzaleaGrowthSpace(BlockPos azaleaPos) {
@@ -701,9 +739,7 @@ public class MossBot extends Module {
 
     private FindItemResult getAvailableLightBlock() {
         FindItemResult hotbarLight = InvUtils.findInHotbar(this::isValidLightStack);
-        if (hotbarLight.found()) {
-            return hotbarLight;
-        }
+        if (hotbarLight.found()) return hotbarLight;
 
         FindItemResult invLight = InvUtils.find(this::isValidLightStack);
         if (invLight.found()) {
@@ -723,9 +759,7 @@ public class MossBot extends Module {
 
     private FindItemResult getAvailableBonemeal() {
         FindItemResult hotbarBonemeal = InvUtils.findInHotbar(Items.BONE_MEAL);
-        if (hotbarBonemeal.found()) {
-            return hotbarBonemeal;
-        }
+        if (hotbarBonemeal.found()) return hotbarBonemeal;
 
         FindItemResult invBonemeal = InvUtils.find(Items.BONE_MEAL);
         if (invBonemeal.found()) {
@@ -749,16 +783,16 @@ public class MossBot extends Module {
                 }
                 pendingCraftCollect = false;
                 pendingCraftTimeout = 0;
-                craftCooldown = 5;
+                craftCooldown = 4;
                 return;
             }
-            if (pendingCraftTimeout > 10) {
+            if (pendingCraftTimeout > 8) {
                 if (handler.getSlot(1).hasStack()) {
                     mc.interactionManager.clickSlot(handler.syncId, 1, 0, SlotActionType.QUICK_MOVE, mc.player);
                 }
                 pendingCraftCollect = false;
                 pendingCraftTimeout = 0;
-                craftCooldown = 5;
+                craftCooldown = 4;
             }
             return;
         }
