@@ -10,3 +10,4 @@ An advanced Meteor Client addon for Minecraft 1.21.11 designed for high-efficien
 - Crosshair Raycasting & FOV Filtering: Ensures the bot only targets blocks in front of you and never behind your back.
 - Automated Spawn-Proofing: Automatically places full light blocks (glowstone, sea lanterns, etc.) in dark surrounding areas.
 
+ps. "moss" You're a pussy <3
