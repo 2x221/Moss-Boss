@@ -33,6 +33,7 @@ import net.minecraft.item.Items;
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.screen.GenericContainerScreenHandler;
+import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.ShulkerBoxScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
@@ -66,7 +67,7 @@ import java.util.concurrent.TimeUnit;
 @SuppressWarnings("unused")
 public class MossPilot extends Module {
     public enum PilotMode {
-        WaveSurfer,
+        PlateauSurfer,
         LawnmowerGrid,
         ExpandingSpiral,
         ManualControl
@@ -76,6 +77,7 @@ public class MossPilot extends Module {
         NONE,
         APPROACH_PAD,
         LANDING,
+        PREP_SPOT,
         PLACE_SHULKER,
         OPEN_SHULKER,
         LOOT_SHULKER,
@@ -105,10 +107,15 @@ public class MossPilot extends Module {
     );
 
     private static final Set<Block> IGNORED_STRUCTURES = Set.of(
-        Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.BEDROCK, Blocks.COBWEB, Blocks.BARRIER
+        Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN, Blocks.BEDROCK, Blocks.COBWEB, Blocks.BARRIER, Blocks.NETHER_PORTAL
+    );
+
+    private static final Set<Block> PASSABLE_PLANTS = Set.of(
+        Blocks.SHORT_GRASS, Blocks.TALL_GRASS, Blocks.FERN, Blocks.LARGE_FERN, Blocks.MOSS_CARPET
     );
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgSafety = settings.createGroup("Anti-Slam & Auto-Eat");
     private final SettingGroup sgScanner = settings.createGroup("Pathing & Scanner");
     private final SettingGroup sgFlight = settings.createGroup("Flight & Speed");
     private final SettingGroup sgRestock = settings.createGroup("Restock");
@@ -116,8 +123,8 @@ public class MossPilot extends Module {
 
     private final Setting<PilotMode> pilotMode = sgGeneral.add(new EnumSetting.Builder<PilotMode>()
         .name("mode")
-        .description("WaveSurfer hugs the ground and rides the active moss edge.")
-        .defaultValue(PilotMode.WaveSurfer)
+        .description("Pathing mode.")
+        .defaultValue(PilotMode.PlateauSurfer)
         .build()
     );
 
@@ -149,9 +156,71 @@ public class MossPilot extends Module {
         .build()
     );
 
+    private final Setting<Boolean> antiSlam = sgSafety.add(new BoolSetting.Builder()
+        .name("anti-slam")
+        .description("Brake horizontal speed before hitting walls or steep terrain to prevent kinetic damage.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> antiSlamDistance = sgSafety.add(new DoubleSetting.Builder()
+        .name("slam-distance")
+        .description("Look-ahead distance in blocks to start braking.")
+        .defaultValue(2.5)
+        .min(1.0)
+        .max(6.0)
+        .sliderMin(1.2)
+        .sliderMax(4.5)
+        .visible(antiSlam::get)
+        .build()
+    );
+
+    private final Setting<Double> antiSlamMinSpeed = sgSafety.add(new DoubleSetting.Builder()
+        .name("slam-min-speed")
+        .description("Safe speed near obstacles (0.18 prevents elytra kinetic damage).")
+        .defaultValue(0.18)
+        .min(0.05)
+        .max(0.35)
+        .sliderMin(0.08)
+        .sliderMax(0.30)
+        .visible(antiSlam::get)
+        .build()
+    );
+
+    private final Setting<Boolean> autoEat = sgSafety.add(new BoolSetting.Builder()
+        .name("auto-eat")
+        .description("Automatically eat gapples or food when health or hunger is low.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> eatHealth = sgSafety.add(new DoubleSetting.Builder()
+        .name("eat-health")
+        .description("Eat a gapple when health drops at or below this value.")
+        .defaultValue(14.0)
+        .min(4.0)
+        .max(20.0)
+        .sliderMin(6.0)
+        .sliderMax(18.0)
+        .visible(autoEat::get)
+        .build()
+    );
+
+    private final Setting<Integer> eatHunger = sgSafety.add(new IntSetting.Builder()
+        .name("eat-hunger")
+        .description("Eat when hunger drops at or below this level.")
+        .defaultValue(14)
+        .min(4)
+        .max(19)
+        .sliderMin(6)
+        .sliderMax(18)
+        .visible(autoEat::get)
+        .build()
+    );
+
     private final Setting<Boolean> matchRenderDistance = sgScanner.add(new BoolSetting.Builder()
         .name("match-render-distance")
-        .description("Scan out to your client render distance when local stone is finished.")
+        .description("Scan out to your client render distance.")
         .defaultValue(true)
         .build()
     );
@@ -159,7 +228,7 @@ public class MossPilot extends Module {
     private final Setting<Integer> scanRange = sgScanner.add(new IntSetting.Builder()
         .name("scan-range")
         .description("Max scan radius in blocks.")
-        .defaultValue(128)
+        .defaultValue(160)
         .min(32)
         .max(384)
         .sliderMin(48)
@@ -185,19 +254,19 @@ public class MossPilot extends Module {
     private final Setting<Double> laneWidth = sgScanner.add(new DoubleSetting.Builder()
         .name("lane-width")
         .description("Distance between lanes.")
-        .defaultValue(7.0)
+        .defaultValue(8.0)
         .min(4.0)
         .max(14.0)
         .sliderMin(5.0)
         .sliderMax(12.0)
-        .visible(() -> pilotMode.get() != PilotMode.WaveSurfer)
+        .visible(() -> pilotMode.get() != PilotMode.PlateauSurfer)
         .build()
     );
 
     private final Setting<Integer> passLength = sgScanner.add(new IntSetting.Builder()
         .name("pass-length")
         .description("Pass length for grid mode.")
-        .defaultValue(48)
+        .defaultValue(56)
         .min(16)
         .max(256)
         .sliderMin(24)
@@ -208,44 +277,51 @@ public class MossPilot extends Module {
 
     private final Setting<Double> workSpeed = sgFlight.add(new DoubleSetting.Builder()
         .name("work-speed")
-        .description("Horizontal speed while spreading moss (0.36 = ~26 km/h).")
-        .defaultValue(0.36)
+        .description("Speed while spreading moss.")
+        .defaultValue(0.68)
         .min(0.15)
-        .max(2.0)
-        .sliderMin(0.2)
-        .sliderMax(1.2)
+        .max(2.5)
+        .sliderMin(0.25)
+        .sliderMax(1.6)
         .build()
     );
 
     private final Setting<Double> cruiseSpeed = sgFlight.add(new DoubleSetting.Builder()
         .name("cruise-speed")
-        .description("Horizontal speed when moving to the next patch.")
-        .defaultValue(0.75)
+        .description("Speed when commuting across non-mossable terrain.")
+        .defaultValue(1.15)
         .min(0.2)
         .max(3.5)
-        .sliderMin(0.3)
+        .sliderMin(0.4)
         .sliderMax(2.5)
+        .build()
+    );
+
+    private final Setting<Boolean> autoPace = sgFlight.add(new BoolSetting.Builder()
+        .name("auto-pace-seed")
+        .description("Briefly dip speed when planting a new seed on bare stone so the patch catches.")
+        .defaultValue(true)
         .build()
     );
 
     private final Setting<Double> verticalSpeed = sgFlight.add(new DoubleSetting.Builder()
         .name("v-speed")
-        .description("Vertical step-up and descent speed.")
-        .defaultValue(0.42)
+        .description("Up and down speed.")
+        .defaultValue(0.55)
         .min(0.15)
         .max(1.5)
         .sliderMin(0.2)
-        .sliderMax(1.0)
+        .sliderMax(1.2)
         .build()
     );
 
     private final Setting<Double> hoverClearance = sgFlight.add(new DoubleSetting.Builder()
         .name("height")
-        .description("Target height above ground (1.8 skims close to the stone like manual flight).")
-        .defaultValue(1.8)
-        .min(1.0)
+        .description("Height above ground.")
+        .defaultValue(2.0)
+        .min(1.2)
         .max(4.5)
-        .sliderMin(1.2)
+        .sliderMin(1.4)
         .sliderMax(3.5)
         .build()
     );
@@ -361,6 +437,7 @@ public class MossPilot extends Module {
     private int scanRingStep = 0;
 
     private Vec3d startPos = null;
+    private double plateauY = Double.NaN;
     private Vec3d forwardVec = new Vec3d(0, 0, 1);
     private Vec3d rightVec = new Vec3d(-1, 0, 0);
     private Vec3d moveHeading = new Vec3d(0, 0, 1);
@@ -371,14 +448,20 @@ public class MossPilot extends Module {
     private Vec3d spiralPos = null;
     private int targetAgeTicks = 0;
     private int antiStuckTicks = 0;
+    private int pitEscapeTicks = 0;
+    private double pitEscapeTargetY = Double.NaN;
     private int bypassTicks = 0;
     private Vec3d bypassDir = null;
     private Vec3d prevPos = null;
 
-    private double curSpeed = 0.36;
+    private double curSpeed = 0.5;
     private int lagbackTicks = 0;
     private int takeoffTicks = 0;
     private int manualTicks = 0;
+
+    private boolean isAutoEating = false;
+    private int autoEatTicks = 0;
+    private boolean swappedForEat = false;
 
     private RestockStage restockStage = RestockStage.NONE;
     private RestockPad restockPad = null;
@@ -405,7 +488,7 @@ public class MossPilot extends Module {
         super(
             mossbot_addon.CATEGORY,
             "moss-pilot",
-            "Auto elytra fly, terrain contour surfer, and restock for Moss Bot."
+            "Auto elytra fly, plateau corridor surfer, anti-slam, and restock for Moss Bot."
         );
     }
 
@@ -426,9 +509,11 @@ public class MossPilot extends Module {
         takeoffTicks = 0;
         manualTicks = 0;
         antiStuckTicks = 0;
+        pitEscapeTicks = 0;
         bypassTicks = 0;
         bypassDir = null;
         prevPos = null;
+        stopAutoEating();
 
         sectorMap.clear();
         deadSectors.clear();
@@ -449,6 +534,7 @@ public class MossPilot extends Module {
     @Override
     public void onDeactivate() {
         stopReconnectThread();
+        stopAutoEating();
 
         if (mc.player != null) {
             mc.player.setNoGravity(false);
@@ -463,9 +549,14 @@ public class MossPilot extends Module {
         restockPad = null;
     }
 
+    public boolean isBusyRestockingOrFleeing() {
+        return restockStage != RestockStage.NONE || fleeState != FleeState.IDLE || isAutoEating;
+    }
+
     public void resetGridHere() {
         if (mc.player == null) return;
         startPos = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        plateauY = estimateInitialPlateauY(mc.player.getBlockPos());
 
         Direction dir = mc.player.getHorizontalFacing();
         forwardVec = new Vec3d(dir.getOffsetX(), 0, dir.getOffsetZ());
@@ -508,6 +599,7 @@ public class MossPilot extends Module {
     public String getStatusSummary() {
         if (!isActive()) return "OFF";
         if (fleeState != FleeState.IDLE) return "FLEE";
+        if (isAutoEating) return "EATING";
         if (restockStage != RestockStage.NONE) return "RESTOCK";
         if (manualTicks > 0) return "MANUAL";
         return pilotMode.get().name();
@@ -555,6 +647,14 @@ public class MossPilot extends Module {
         if (clickDelay > 0) clickDelay--;
         if (restockCooldown > 0) restockCooldown--;
 
+        if (autoEat.get() && tickAutoEat()) {
+            if (mc.player.isGliding()) {
+                mc.player.setNoGravity(true);
+                mc.player.setVelocity(0, 0, 0);
+            }
+            return;
+        }
+
         if (pauseOnEat.get() && MossBot.isEating(mc)) {
             if (mc.player.isGliding()) {
                 mc.player.setNoGravity(true);
@@ -581,6 +681,7 @@ public class MossPilot extends Module {
                     mc.player.setVelocity(0, 0, 0);
                 }
                 if (manualTicks == 0) {
+                    plateauY = estimateInitialPlateauY(mc.player.getBlockPos());
                     targetPos = pickNextTarget();
                 }
                 return;
@@ -610,8 +711,88 @@ public class MossPilot extends Module {
         if (pilotMode.get() == PilotMode.ManualControl) {
             tickManualFly();
         } else {
-            tickWaveSurfer();
+            tickPlateauSurfer();
         }
+    }
+
+    private boolean tickAutoEat() {
+        if (mc.player == null) return false;
+
+        boolean lowHealth = mc.player.getHealth() <= eatHealth.get();
+        boolean lowHunger = mc.player.getHungerManager().getFoodLevel() <= eatHunger.get();
+
+        if (!isAutoEating) {
+            if (!lowHealth && !lowHunger) return false;
+
+            if (isEdibleFood(mc.player.getOffHandStack())) {
+                if (mc.player.getMainHandStack().getItem() instanceof BlockItem) {
+                    swapPickaxe();
+                }
+                swappedForEat = false;
+                isAutoEating = true;
+                autoEatTicks = 0;
+                mc.options.useKey.setPressed(true);
+                return true;
+            }
+
+            FindItemResult food = findBestFood();
+            if (!food.found()) return false;
+
+            if (food.slot() >= 9) {
+                InvUtils.move().from(food.slot()).toHotbar(3);
+                InvUtils.swap(3, true);
+            } else {
+                InvUtils.swap(food.slot(), true);
+            }
+
+            swappedForEat = true;
+            isAutoEating = true;
+            autoEatTicks = 0;
+            mc.options.useKey.setPressed(true);
+            return true;
+        }
+
+        autoEatTicks++;
+        boolean healedEnough = mc.player.getHealth() > eatHealth.get() + 2.0 || (lowHealth && mc.player.getAbsorptionAmount() >= 4.0);
+        boolean hungerFull = mc.player.getHungerManager().getFoodLevel() >= 19;
+
+        if ((healedEnough && (!lowHunger || hungerFull)) || autoEatTicks > 42) {
+            stopAutoEating();
+            return false;
+        }
+
+        mc.options.useKey.setPressed(true);
+        return true;
+    }
+
+    private void stopAutoEating() {
+        if (isAutoEating) {
+            if (mc.options != null) {
+                mc.options.useKey.setPressed(false);
+            }
+            if (swappedForEat && mc.player != null) {
+                InvUtils.swapBack();
+                swappedForEat = false;
+            }
+            isAutoEating = false;
+            autoEatTicks = 0;
+        }
+    }
+
+    private FindItemResult findBestFood() {
+        FindItemResult ega = InvUtils.find(Items.ENCHANTED_GOLDEN_APPLE);
+        if (ega.found()) return ega;
+        FindItemResult ga = InvUtils.find(Items.GOLDEN_APPLE);
+        if (ga.found()) return ga;
+        return InvUtils.find(this::isEdibleFood);
+    }
+
+    private boolean isEdibleFood(ItemStack s) {
+        if (s == null || s.isEmpty()) return false;
+        if (s.isOf(Items.ROTTEN_FLESH) || s.isOf(Items.SPIDER_EYE) || s.isOf(Items.PUFFERFISH) || s.isOf(Items.CHORUS_FRUIT)) {
+            return false;
+        }
+        return s.get(DataComponentTypes.FOOD) != null;
     }
 
     private boolean isMovingManually() {
@@ -639,6 +820,7 @@ public class MossPilot extends Module {
 
         if (mc.player.isGliding()) {
             mc.player.setNoGravity(true);
+            mc.player.fallDistance = 0f;
             takeoffTicks = 0;
             return true;
         }
@@ -670,6 +852,7 @@ public class MossPilot extends Module {
     private void tickManualFly() {
         if (mc.player == null) return;
         mc.player.setNoGravity(true);
+        mc.player.fallDistance = 0f;
 
         if (lagbackTicks > 0) {
             mc.player.setVelocity(0, 0, 0);
@@ -686,7 +869,7 @@ public class MossPilot extends Module {
         double vx = 0.0, vz = 0.0, vy = 0.0;
 
         if (fwd != 0f || side != 0f) {
-            curSpeed = Math.min(cruiseSpeed.get(), curSpeed + 0.06);
+            curSpeed = Math.min(cruiseSpeed.get(), curSpeed + 0.08);
             float yaw = mc.player.getYaw();
             if (fwd != 0f) {
                 if (side > 0f) yaw += (fwd > 0f ? -45f : 45f);
@@ -705,14 +888,31 @@ public class MossPilot extends Module {
         if (mc.options.jumpKey.isPressed()) vy = verticalSpeed.get();
         else if (mc.options.sneakKey.isPressed()) vy = -verticalSpeed.get();
 
-        mc.player.setVelocity(vx, vy, vz);
+        Vec3d vel = antiSlam.get() ? applyAntiSlam(new Vec3d(vx, vy, vz)) : new Vec3d(vx, vy, vz);
+        mc.player.setVelocity(vel);
     }
 
-    private void tickWaveSurfer() {
+    /*
+     _______      __      _  __   ______     __        __  _    _       __      _______
+    |__   __|    /  \    | |/ /  |  ____|    \ \      / / | |  | |     /  \    |__   __|
+       | |      / /\ \   | ' /   | |__        \ \ /\ / /  | |__| |    / /\ \      | |
+       | |     / ____ \  |  <    |  __|        \ V  V /   |  __  |   / ____ \     | |
+       |_|    /_/    \_\ |_|\_\  |______|       \_/\_/    |_|  |_|  /_/    \_\    |_|
+
+    __    __   ____    _    _      _   _   ______   ______   _____            _______
+    \ \  / /  / __ \  | |  | |    | \ | | |  ____| |  ____| |  __ \         .'       '.
+     \ \/ /  | |  | | | |  | |    |  \| | | |__    | |__    | |  | |       /   >   <   \
+      |  |   | |__| | | |__| |    | |\  | |  __|   |  __|   | |__| |      |    _____    |
+      |__|    \____/   \____/     |_| \_| |______| |______| |_____/        \   \___/   /
+                                                                            '._______.'
+    */
+
+    private void tickPlateauSurfer() {
         if (mc.player == null || mc.world == null) return;
         if (startPos == null) resetGridHere();
 
         mc.player.setNoGravity(true);
+        mc.player.fallDistance = 0f;
         Vec3d pos = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
 
         BlockPos bp = BlockPos.ofFloored(pos.x, pos.y, pos.z);
@@ -726,19 +926,30 @@ public class MossPilot extends Module {
             return;
         }
 
-        if (pilotMode.get() == PilotMode.WaveSurfer) {
+        if (pitEscapeTicks > 0) {
+            pitEscapeTicks--;
+            if (pos.y < pitEscapeTargetY && mc.world.isSpaceEmpty(mc.player, mc.player.getBoundingBox().offset(0, 0.8, 0))) {
+                mc.player.setVelocity(0, verticalSpeed.get(), 0);
+                return;
+            } else {
+                plateauY = pos.y - hoverClearance.get();
+                pitEscapeTicks = 0;
+                targetPos = pickNextTarget();
+            }
+        }
+
+        if (pilotMode.get() == PilotMode.PlateauSurfer) {
             updateBackgroundSectorScanner(bp);
         }
 
-        int localWork = countActiveWorkUnderPlayer(bp);
-        if (neverReturn.get() && localWork == 0) {
+        LocalWorkInfo workInfo = inspectLocalWork(bp);
+        if (neverReturn.get() && workInfo.convertible == 0 && workInfo.frontier == 0) {
             markCoordVisited(pos.x, pos.z);
         }
 
-        // Volytra-style Anti-Stuck: if horizontal displacement is < 0.05 blocks, trigger smooth bypass
         if (prevPos != null) {
             double movedHorizSq = (pos.x - prevPos.x) * (pos.x - prevPos.x) + (pos.z - prevPos.z) * (pos.z - prevPos.z);
-            if (movedHorizSq < 0.0025 || mc.player.horizontalCollision) {
+            if (movedHorizSq < 0.003 || mc.player.horizontalCollision) {
                 antiStuckTicks++;
             } else {
                 antiStuckTicks = 0;
@@ -748,7 +959,14 @@ public class MossPilot extends Module {
 
         if (antiStuckTicks >= 4) {
             if (targetPos != null) markCoordVisited(targetPos.x, targetPos.z);
-            bypassDir = findOpenEscapeHeading(pos, moveHeading);
+            double rimY = findPitRimHeight(bp);
+            if (rimY > pos.y + 2.5 && mc.world.isSpaceEmpty(mc.player, mc.player.getBoundingBox().offset(0, 1.5, 0))) {
+                pitEscapeTargetY = rimY + hoverClearance.get();
+                pitEscapeTicks = 28;
+                antiStuckTicks = 0;
+                return;
+            }
+            bypassDir = findOpenEscapeHeading(moveHeading);
             bypassTicks = 8;
             moveHeading = bypassDir;
             targetPos = pickNextTarget();
@@ -756,7 +974,7 @@ public class MossPilot extends Module {
         }
 
         targetAgeTicks++;
-        if (targetPos == null || targetAgeTicks > 45) {
+        if (targetPos == null || targetAgeTicks > 50) {
             targetPos = pickNextTarget();
             targetAgeTicks = 0;
         }
@@ -765,8 +983,8 @@ public class MossPilot extends Module {
         double dz = targetPos.z - pos.z;
         double horizDist = Math.sqrt(dx * dx + dz * dz);
 
-        if (horizDist < 1.6 || (pilotMode.get() == PilotMode.WaveSurfer && targetAgeTicks >= 8 && localWork <= 1)) {
-            if (horizDist < 2.0 && localWork == 0) {
+        if (horizDist < 2.2 || (pilotMode.get() == PilotMode.PlateauSurfer && targetAgeTicks >= 12 && workInfo.convertible == 0 && workInfo.frontier == 0 && horizDist < 7.0)) {
+            if (horizDist < 2.5 && workInfo.convertible == 0) {
                 markCoordVisited(targetPos.x, targetPos.z);
             }
             targetPos = pickNextTarget();
@@ -787,31 +1005,46 @@ public class MossPilot extends Module {
             dirZ = horizDist > 0.001 ? dz / horizDist : moveHeading.z;
         }
 
-        // Direct Contour Following: sample ground under player and 1-3 blocks ahead
-        double contourY = getContourGroundY(pos, dirX, dirZ);
-        double desiredY = Double.isNaN(contourY)
-            ? (targetPos.y + hoverClearance.get())
-            : (contourY + hoverClearance.get());
+        double rawGroundY = getPlateauSafeGroundY(pos, dirX, dirZ);
+        if (!Double.isNaN(rawGroundY)) {
+            if (Double.isNaN(plateauY)) {
+                plateauY = rawGroundY;
+            } else if (rawGroundY >= plateauY - 4.0 && rawGroundY <= plateauY + 4.5) {
+                plateauY = MathHelper.lerp(0.18, plateauY, rawGroundY);
+            }
+        }
 
+        double effectiveGroundY = Double.isNaN(rawGroundY) ? plateauY : Math.max(rawGroundY, plateauY - 3.5);
+        double desiredY = effectiveGroundY + hoverClearance.get();
         double dy = desiredY - pos.y;
         double vSpd = verticalSpeed.get();
 
-        // Symmetrical up AND down contour tracking so we never float high in the air after a bump
         double vy = 0.0;
         if (Math.abs(dy) > 0.12) {
-            vy = MathHelper.clamp(dy * 0.55, -vSpd, vSpd);
+            vy = MathHelper.clamp(dy * 0.6, -vSpd, vSpd);
         }
 
-        // If a 1-2 block step is directly in front of our hitbox, lift up immediately while moving
-        if (isStepAhead(pos, dirX, dirZ)) {
+        if (isStepAhead(dirX, dirZ)) {
             vy = vSpd;
         }
 
-        double goalSpeed = (localWork > 0 || horizDist < 12.0) ? workSpeed.get() : cruiseSpeed.get();
-        curSpeed = MathHelper.lerp(0.25, curSpeed, goalSpeed);
-        double speed = horizDist < curSpeed ? Math.max(0.22, horizDist) : curSpeed;
+        double goalSpeed;
+        if (workInfo.convertible > 0 && workInfo.frontier == 0 && autoPace.get() && countItem(Items.MOSS_BLOCK) > 0) {
+            goalSpeed = Math.min(workSpeed.get(), 0.38);
+        } else if (workInfo.convertible > 0 || workInfo.frontier > 0) {
+            goalSpeed = workSpeed.get();
+        } else {
+            goalSpeed = cruiseSpeed.get();
+        }
 
-        Vec3d finalVel = steerCleanPath(pos, dirX, vy, dirZ, speed);
+        curSpeed = MathHelper.lerp(0.3, curSpeed, goalSpeed);
+        double speed = horizDist < curSpeed ? Math.max(0.28, horizDist) : curSpeed;
+
+        Vec3d finalVel = steerCleanPath(dirX, vy, dirZ, speed);
+        if (antiSlam.get()) {
+            finalVel = applyAntiSlam(finalVel);
+        }
+
         if (finalVel.horizontalLengthSquared() > 0.002) {
             moveHeading = new Vec3d(finalVel.x, 0, finalVel.z).normalize();
         }
@@ -819,55 +1052,117 @@ public class MossPilot extends Module {
         mc.player.setVelocity(finalVel);
     }
 
-    private Vec3d findOpenEscapeHeading(Vec3d pos, Vec3d currentHeading) {
+    private Vec3d applyAntiSlam(Vec3d vel) {
+        if (mc.world == null || mc.player == null) return vel;
+
+        double hSpd = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+        double minSafe = antiSlamMinSpeed.get();
+        if (hSpd <= minSafe) return vel;
+
+        double dirX = vel.x / hSpd;
+        double dirZ = vel.z / hSpd;
+        double maxDist = antiSlamDistance.get();
+        Box paddedBox = mc.player.getBoundingBox().expand(0.15, 0.05, 0.15);
+
+        double obstacleDist = maxDist + 1.0;
+        for (double d = 0.4; d <= maxDist; d += 0.35) {
+            Box check = paddedBox.offset(dirX * d, vel.y * (d / hSpd) * 0.5, dirZ * d);
+            if (!mc.world.isSpaceEmpty(mc.player, check)) {
+                obstacleDist = d;
+                break;
+            }
+        }
+
+        if (obstacleDist <= maxDist) {
+            if (obstacleDist <= 0.85) {
+                double lift = mc.world.isSpaceEmpty(mc.player, paddedBox.offset(0, 0.8, 0)) ? verticalSpeed.get() : 0.0;
+                return new Vec3d(dirX * minSafe * 0.5, lift, dirZ * minSafe * 0.5);
+            }
+            double ratio = MathHelper.clamp((obstacleDist - 0.85) / Math.max(0.2, maxDist - 0.85), 0.0, 1.0);
+            double newSpd = MathHelper.lerp(ratio, minSafe, hSpd);
+            curSpeed = Math.min(curSpeed, newSpd);
+            return new Vec3d(dirX * newSpd, Math.max(vel.y, 0.15), dirZ * newSpd);
+        }
+
+        return vel;
+    }
+
+    private double estimateInitialPlateauY(BlockPos center) {
+        if (mc.world == null) return center.getY() - hoverClearance.get();
+        List<Integer> heights = new ArrayList<>();
+        for (int dx = -6; dx <= 6; dx += 3) {
+            for (int dz = -6; dz <= 6; dz += 3) {
+                BlockPos surf = findGroundColumn(center.getX() + dx, center.getY(), center.getZ() + dz);
+                if (surf != null) heights.add(surf.getY() + 1);
+            }
+        }
+        if (heights.isEmpty()) return center.getY() - hoverClearance.get();
+        Collections.sort(heights);
+        return heights.get((int) Math.floor((heights.size() - 1) * 0.65));
+    }
+
+    private double findPitRimHeight(BlockPos center) {
+        if (mc.world == null) return center.getY();
+        int maxRim = center.getY();
+        for (Direction dir : Direction.Type.HORIZONTAL) {
+            for (int dist = 2; dist <= 6; dist += 2) {
+                BlockPos check = center.offset(dir, dist);
+                for (int y = center.getY() + 14; y > center.getY(); y--) {
+                    BlockPos p = new BlockPos(check.getX(), y, check.getZ());
+                    BlockState s = mc.world.getBlockState(p);
+                    if (!s.isAir() && !IGNORED_STRUCTURES.contains(s.getBlock()) && isPassableAir(mc.world.getBlockState(p.up()))) {
+                        if (y + 1 > maxRim) maxRim = y + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        return maxRim;
+    }
+
+    private Vec3d findOpenEscapeHeading(Vec3d currentHeading) {
         double baseAngle = Math.atan2(currentHeading.z, currentHeading.x);
-        double[] testAngles = new double[]{65, -65, 110, -110, 150, -150, 180};
+        double[] testAngles = new double[]{55, -55, 105, -105, 150, -150, 180};
         for (double deg : testAngles) {
             double rad = baseAngle + Math.toRadians(deg);
             double cx = Math.cos(rad);
             double cz = Math.sin(rad);
-            if (isBoxPathClear(cx * 0.4, 0.25, cz * 0.4, 3.0)) {
+            if (isBoxPathClear(cx * 0.45, 0.25, cz * 0.45, 3.0)) {
                 return new Vec3d(cx, 0, cz);
             }
         }
         return new Vec3d(-currentHeading.x, 0, -currentHeading.z);
     }
 
-    private boolean isStepAhead(Vec3d pos, double dirX, double dirZ) {
+    private boolean isStepAhead(double dirX, double dirZ) {
         if (mc.world == null || mc.player == null) return false;
-        Box feetBox = mc.player.getBoundingBox().offset(dirX * 0.9, 0, dirZ * 0.9);
-        Box steppedBox = mc.player.getBoundingBox().offset(dirX * 0.9, 1.2, dirZ * 0.9);
+        Box feetBox = mc.player.getBoundingBox().expand(0.12, 0.0, 0.12).offset(dirX * 1.2, 0, dirZ * 1.2);
+        Box steppedBox = mc.player.getBoundingBox().expand(0.12, 0.0, 0.12).offset(dirX * 1.2, 1.3, dirZ * 1.2);
         return !mc.world.isSpaceEmpty(mc.player, feetBox) && mc.world.isSpaceEmpty(mc.player, steppedBox);
     }
 
-    /**
-     * Tracks the true terrain contour right underneath and 1 to 3 blocks ahead of the player.
-     * Bridges 1-block holes (by taking the highest block in the local 3x3) while immediately following
-     * downward slopes so the player stays hugged 1.8 blocks above the stone.
-     */
-    private double getContourGroundY(Vec3d pos, double dirX, double dirZ) {
+    private double getPlateauSafeGroundY(Vec3d pos, double dirX, double dirZ) {
         if (mc.world == null) return Double.NaN;
         int feetY = MathHelper.floor(pos.y);
+        double minAcceptableFloor = Double.isNaN(plateauY) ? (feetY - 8) : (plateauY - 4.5);
 
-        // 1. Find the highest block in the 3x3 directly under the player (bridges 1x1 and 2x2 holes)
         double underMaxY = Double.NaN;
         for (int ox = -1; ox <= 1; ox++) {
             for (int oz = -1; oz <= 1; oz++) {
                 BlockPos surf = findGroundColumn(MathHelper.floor(pos.x) + ox, feetY, MathHelper.floor(pos.z) + oz);
-                if (surf != null) {
+                if (surf != null && surf.getY() + 1 >= minAcceptableFloor) {
                     double y = surf.getY() + 1.0;
                     if (Double.isNaN(underMaxY) || y > underMaxY) underMaxY = y;
                 }
             }
         }
 
-        // 2. Check 1 to 3 blocks ahead along flight vector
         double aheadMaxY = Double.NaN;
-        for (int step = 1; step <= 3; step++) {
+        for (int step = 1; step <= 4; step++) {
             int fx = MathHelper.floor(pos.x + dirX * step);
             int fz = MathHelper.floor(pos.z + dirZ * step);
             BlockPos surf = findGroundColumn(fx, feetY, fz);
-            if (surf != null) {
+            if (surf != null && surf.getY() + 1 >= minAcceptableFloor) {
                 double y = surf.getY() + 1.0;
                 if (Double.isNaN(aheadMaxY) || y > aheadMaxY) aheadMaxY = y;
             }
@@ -876,22 +1171,16 @@ public class MossPilot extends Module {
         if (Double.isNaN(underMaxY)) return aheadMaxY;
         if (Double.isNaN(aheadMaxY)) return underMaxY;
 
-        // If ahead is higher, step up early; if ahead is lower, follow the slope down smoothly
         if (aheadMaxY > underMaxY) {
             return aheadMaxY;
         }
-        return (underMaxY * 0.4) + (aheadMaxY * 0.6);
+        return (underMaxY * 0.45) + (aheadMaxY * 0.55);
     }
 
-    /**
-     * Finds the natural ground surface near the player's current height.
-     * Never scans more than +2 blocks above the player's feet so it NEVER locks onto overhead obsidian highways.
-     */
     private BlockPos findGroundColumn(int x, int feetY, int z) {
         if (mc.world == null) return null;
 
         int maxStart = feetY + 2;
-        // Do not scan above feetY if there is a solid block at feetY + 2
         if (!isPassableAir(mc.world.getBlockState(new BlockPos(x, maxStart + 1, z)))) {
             maxStart = feetY;
         }
@@ -918,10 +1207,52 @@ public class MossPilot extends Module {
         return null;
     }
 
+    private PatchStats sampleGridPatch(int startX, int startZ, int step, int refY) {
+        if (mc.world == null) return new PatchStats(0, 0, 0, refY);
+        int frontier = 0;
+        int convertible = 0;
+        int fluid = 0;
+        int sumY = 0;
+        int cols = 0;
+
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                BlockPos top = findGroundColumn(startX + i * step, refY, startZ + j * step);
+                if (top == null) continue;
+
+                BlockState s = mc.world.getBlockState(top);
+                if (!s.getFluidState().isEmpty() || !mc.world.getBlockState(top.up()).getFluidState().isEmpty()) {
+                    fluid++;
+                    continue;
+                }
+
+                if (!Double.isNaN(plateauY) && top.getY() + 1 < plateauY - 5.0) {
+                    continue;
+                }
+
+                Block b = s.getBlock();
+                if (b == Blocks.MOSS_BLOCK) {
+                    if (hasAdjacentConvertible(top)) {
+                        frontier++;
+                        sumY += top.getY() + 1;
+                        cols++;
+                    }
+                } else if (MossBot.CONVERTIBLE_BLOCKS.contains(b)) {
+                    convertible++;
+                    sumY += top.getY() + 1;
+                    cols++;
+                }
+            }
+        }
+
+        int avgY = cols > 0 ? (sumY / cols) : refY;
+        return new PatchStats(frontier, convertible, fluid, avgY);
+    }
+
     private Vec3d pickNextTarget() {
-        if (pilotMode.get() == PilotMode.WaveSurfer && mc.player != null && mc.world != null) {
-            Vec3d waveTarget = findLocalWaveTarget();
-            if (waveTarget != null) return waveTarget;
+        if (pilotMode.get() == PilotMode.PlateauSurfer && mc.player != null && mc.world != null) {
+            Vec3d corridorTarget = findBestPlateauCorridor();
+            if (corridorTarget != null) return corridorTarget;
 
             Vec3d sectorTarget = pickBestScannedSector();
             if (sectorTarget != null) return sectorTarget;
@@ -929,84 +1260,66 @@ public class MossPilot extends Module {
         return getNextGeometricWaypoint();
     }
 
-    /**
-     * Scans 2 to 18 blocks around the player for:
-     * 1. Active Frontier Moss (moss blocks with adjacent convertible stone/dirt)
-     * 2. Bare convertible stone/dirt right next to the player
-     * Scores candidates so the bot sweeps smoothly forward along the green edge without jumping across the map.
-     */
-    private Vec3d findLocalWaveTarget() {
+    private Vec3d findBestPlateauCorridor() {
         if (mc.player == null || mc.world == null) return null;
 
-        BlockPos playerPos = mc.player.getBlockPos();
+        int refY = mc.player.getBlockY();
         double px = mc.player.getX();
         double py = mc.player.getY();
         double pz = mc.player.getZ();
 
-        Vec3d bestTarget = null;
+        Vec3d bestWaypoint = null;
         double bestScore = -1e9;
 
-        for (int dx = -15; dx <= 15; dx += 3) {
-            for (int dz = -15; dz <= 15; dz += 3) {
-                double distSq = (double) dx * dx + (double) dz * dz;
-                if (distSq < 4.0 || distSq > 256.0) continue;
+        for (int i = 0; i < 24; i++) {
+            double rad = Math.toRadians(i * 15.0);
+            double dirX = Math.cos(rad);
+            double dirZ = Math.sin(rad);
 
-                double wx = px + dx;
-                double wz = pz + dz;
-                if (isCoordVisited(wx, wz)) continue;
+            int totalFrontier = 0;
+            int totalConvertible = 0;
+            int fluidHits = 0;
+            int pitDrops = 0;
+            double bestDistAlongRay = 14.0;
+            int bestYAlongRay = refY;
 
-                int frontierMoss = 0;
-                int convertibleStone = 0;
-                int fluid = 0;
-                int sumY = 0;
-                int validCols = 0;
+            for (int dist = 5; dist <= 20; dist += 5) {
+                double cx = px + dirX * dist;
+                double cz = pz + dirZ * dist;
+                if (isCoordVisited(cx, cz)) continue;
 
-                for (int ox = -1; ox <= 1; ox++) {
-                    for (int oz = -1; oz <= 1; oz++) {
-                        BlockPos surf = findGroundColumn(MathHelper.floor(wx) + ox, playerPos.getY(), MathHelper.floor(wz) + oz);
-                        if (surf == null) continue;
+                PatchStats stats = sampleGridPatch(MathHelper.floor(cx) - 2, MathHelper.floor(cz) - 2, 2, refY);
+                fluidHits += stats.fluid;
 
-                        BlockState s = mc.world.getBlockState(surf);
-                        if (!s.getFluidState().isEmpty() || !mc.world.getBlockState(surf.up()).getFluidState().isEmpty()) {
-                            fluid++;
-                            continue;
-                        }
-
-                        Block b = s.getBlock();
-                        if (b == Blocks.MOSS_BLOCK) {
-                            if (hasAdjacentConvertible(surf)) {
-                                frontierMoss += 3;
-                                sumY += surf.getY() + 1;
-                                validCols++;
-                            }
-                        } else if (MossBot.CONVERTIBLE_BLOCKS.contains(b)) {
-                            convertibleStone++;
-                            sumY += surf.getY() + 1;
-                            validCols++;
-                        }
-                    }
+                if (stats.frontier == 0 && stats.convertible == 0) {
+                    pitDrops++;
+                } else {
+                    totalFrontier += stats.frontier;
+                    totalConvertible += stats.convertible;
+                    bestDistAlongRay = dist;
+                    bestYAlongRay = stats.avgY;
                 }
+            }
 
-                if (avoidWater.get() && fluid > 0) continue;
-                if (frontierMoss == 0 && convertibleStone < 2) continue;
+            if (avoidWater.get() && fluidHits >= 2) continue;
+            if (totalFrontier == 0 && totalConvertible < 3) continue;
 
-                double avgY = validCols > 0 ? (double) sumY / validCols : py;
-                double dist = Math.sqrt(distSq);
-                double alignment = ((dx / dist) * moveHeading.x) + ((dz / dist) * moveHeading.z);
-                double heightDiff = Math.abs(avgY - (py - hoverClearance.get()));
+            double alignment = (dirX * moveHeading.x) + (dirZ * moveHeading.z);
+            double elevationDiff = Math.abs(bestYAlongRay - plateauY);
 
-                // Strongly prefer close frontier blocks along our forward sweep arc
-                double score = (frontierMoss * 14.0) + (convertibleStone * 4.0)
-                    + (alignment * 16.0) - (dist * 2.8) - (heightDiff * 3.0);
+            double score = (totalFrontier * 26.0)
+                + (totalConvertible * 6.5)
+                + (alignment * 22.0)
+                - (pitDrops * 18.0)
+                - (elevationDiff * 3.5);
 
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestTarget = new Vec3d(wx, avgY, wz);
-                }
+            if (score > bestScore) {
+                bestScore = score;
+                bestWaypoint = new Vec3d(px + dirX * bestDistAlongRay, bestYAlongRay, pz + dirZ * bestDistAlongRay);
             }
         }
 
-        return bestTarget;
+        return bestWaypoint;
     }
 
     private boolean hasAdjacentConvertible(BlockPos mossPos) {
@@ -1026,37 +1339,33 @@ public class MossPilot extends Module {
         return false;
     }
 
-    private int countActiveWorkUnderPlayer(BlockPos playerPos) {
-        if (mc.world == null) return 0;
-        int work = 0;
+    private LocalWorkInfo inspectLocalWork(BlockPos playerPos) {
+        if (mc.world == null) return new LocalWorkInfo(0, 0);
+        int convertible = 0;
+        int frontier = 0;
         for (int dx = -4; dx <= 4; dx += 2) {
             for (int dz = -4; dz <= 4; dz += 2) {
                 BlockPos surf = findGroundColumn(playerPos.getX() + dx, playerPos.getY(), playerPos.getZ() + dz);
                 if (surf == null) continue;
                 Block b = mc.world.getBlockState(surf).getBlock();
                 if (MossBot.CONVERTIBLE_BLOCKS.contains(b)) {
-                    work++;
+                    convertible++;
                 } else if (b == Blocks.MOSS_BLOCK && hasAdjacentConvertible(surf)) {
-                    work += 2;
+                    frontier++;
                 }
-                if (work >= 6) return work;
             }
         }
-        return work;
+        return new LocalWorkInfo(convertible, frontier);
     }
 
     private boolean isPassableAir(BlockState s) {
-        return s.isAir()
-            || s.isOf(Blocks.SHORT_GRASS)
-            || s.isOf(Blocks.TALL_GRASS)
-            || s.isOf(Blocks.FERN)
-            || s.isOf(Blocks.LARGE_FERN)
-            || s.isOf(Blocks.MOSS_CARPET);
+        return s.isAir() || PASSABLE_PLANTS.contains(s.getBlock());
     }
 
-    private Vec3d steerCleanPath(Vec3d pos, double dirX, double desiredVy, double dirZ, double speed) {
+    private Vec3d steerCleanPath(double dirX, double desiredVy, double dirZ, double speed) {
         double baseAngle = Math.atan2(dirZ, dirX);
         double vSpd = verticalSpeed.get();
+        double minSafe = antiSlam.get() ? antiSlamMinSpeed.get() : speed * 0.5;
 
         double[] vyOptions = new double[]{desiredVy, vSpd, -vSpd * 0.5, 0.0};
         double[] anglesDeg = new double[]{
@@ -1068,9 +1377,9 @@ public class MossPilot extends Module {
                 double rad = baseAngle + Math.toRadians(deg);
                 double cx = Math.cos(rad);
                 double cz = Math.sin(rad);
-                double spd = Math.abs(deg) > 60 ? speed * 0.75 : speed;
+                double spd = Math.abs(deg) > 45 ? Math.min(speed * 0.65, minSafe * 1.4) : speed;
 
-                if (isBoxPathClear(cx * spd, vy, cz * spd, 2.2)) {
+                if (isBoxPathClear(cx * spd, vy, cz * spd, 2.5)) {
                     return new Vec3d(cx * spd, vy, cz * spd);
                 }
             }
@@ -1079,14 +1388,14 @@ public class MossPilot extends Module {
         if (isBoxPathClear(0, vSpd, 0, 1.5)) {
             return new Vec3d(0, vSpd, 0);
         }
-        return new Vec3d(-dirX * 0.3, 0.25, -dirZ * 0.3);
+        return new Vec3d(0, 0.25, 0);
     }
 
     private boolean isBoxPathClear(double vx, double vy, double vz, double ticksAhead) {
         if (mc.world == null || mc.player == null) return false;
-        Box box = mc.player.getBoundingBox().expand(-0.05);
+        Box box = mc.player.getBoundingBox().expand(0.14, 0.06, 0.14);
 
-        for (double t = 0.8; t <= ticksAhead; t += 0.7) {
+        for (double t = 0.5; t <= ticksAhead; t += 0.5) {
             Box next = box.offset(vx * t, vy * t, vz * t);
             if (!mc.world.isSpaceEmpty(mc.player, next)) return false;
 
@@ -1112,7 +1421,7 @@ public class MossPilot extends Module {
         int refY = playerPos.getY();
 
         int maxSectorRadius = Math.max(4, getEffectiveScanRadiusBlocks() >> 3);
-        int budget = 32;
+        int budget = 36;
 
         while (budget > 0) {
             if (scanRingRadius > maxSectorRadius) {
@@ -1155,46 +1464,16 @@ public class MossPilot extends Module {
         int baseX = sx << 3;
         int baseZ = sz << 3;
 
-        int convertible = 0;
-        int frontier = 0;
-        int fluid = 0;
-        int sumY = 0;
-        int cols = 0;
-
-        for (int ox = 1; ox <= 7; ox += 3) {
-            for (int oz = 1; oz <= 7; oz += 3) {
-                BlockPos top = findGroundColumn(baseX + ox, refY, baseZ + oz);
-                if (top == null) continue;
-
-                BlockState state = mc.world.getBlockState(top);
-                if (!state.getFluidState().isEmpty() || !mc.world.getBlockState(top.up()).getFluidState().isEmpty()) {
-                    fluid++;
-                    continue;
-                }
-
-                Block b = state.getBlock();
-                if (MossBot.CONVERTIBLE_BLOCKS.contains(b)) {
-                    convertible++;
-                    sumY += top.getY() + 1;
-                    cols++;
-                } else if (b == Blocks.MOSS_BLOCK && hasAdjacentConvertible(top)) {
-                    frontier++;
-                    sumY += top.getY() + 1;
-                    cols++;
-                }
-            }
-        }
-
-        if ((avoidWater.get() && fluid >= 2) || (convertible + frontier < 2)) {
+        PatchStats stats = sampleGridPatch(baseX + 1, baseZ + 1, 3, refY);
+        if ((avoidWater.get() && stats.fluid >= 2) || (stats.convertible + stats.frontier < 3)) {
             sectorMap.remove(key);
-            if (fluid >= 2 || (convertible == 0 && frontier == 0)) {
+            if (stats.fluid >= 2 || (stats.convertible == 0 && stats.frontier == 0)) {
                 deadSectors.add(key);
             }
             return;
         }
 
-        int avgY = cols > 0 ? (sumY / cols) : refY;
-        sectorMap.put(key, new SectorInfo(baseX + 4.0, avgY, baseZ + 4.0, convertible, frontier));
+        sectorMap.put(key, new SectorInfo(baseX + 4.0, stats.avgY, baseZ + 4.0, stats.convertible, stats.frontier));
     }
 
     private Vec3d pickBestScannedSector() {
@@ -1224,7 +1503,7 @@ public class MossPilot extends Module {
             if (dist < 4.0) continue;
 
             double alignment = ((dx / dist) * moveHeading.x) + ((dz / dist) * moveHeading.z);
-            double score = (s.frontier * 12.0) + (s.convertible * 5.0) + (alignment * 12.0) - (dist * 2.0) - Math.abs(s.y - py) * 2.0;
+            double score = (s.frontier * 14.0) + (s.convertible * 6.0) + (alignment * 14.0) - (dist * 1.8) - Math.abs(s.y - plateauY) * 2.5;
 
             if (score > bestScore) {
                 bestScore = score;
@@ -1338,6 +1617,7 @@ public class MossPilot extends Module {
         switch (fleeState) {
             case IDLE -> {
                 if (target != null || hitByPlayer) {
+                    stopAutoEating();
                     Vec3d pos = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
                     if (target != null) {
                         Vec3d away = new Vec3d(pos.x - target.getX(), 0, pos.z - target.getZ());
@@ -1412,10 +1692,13 @@ public class MossPilot extends Module {
 
         curSpeed = Math.min(fleeSpeed.get(), curSpeed + 0.12);
         Vec3d pos = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
-        double envY = getContourGroundY(pos, dir.x, dir.z);
+        double envY = getPlateauSafeGroundY(pos, dir.x, dir.z);
         double desiredVy = (!Double.isNaN(envY) && pos.y < envY + 5.0) ? verticalSpeed.get() : 0.0;
 
-        Vec3d vel = steerCleanPath(pos, dir.x, desiredVy, dir.z, curSpeed);
+        Vec3d vel = steerCleanPath(dir.x, desiredVy, dir.z, curSpeed);
+        if (antiSlam.get()) {
+            vel = applyAntiSlam(vel);
+        }
         mc.player.setVelocity(vel);
     }
 
@@ -1471,10 +1754,6 @@ public class MossPilot extends Module {
         return !echestEmpty && countItem(Items.ENDER_CHEST) >= 1;
     }
 
-    /**
-     * Finds a flat 3x3 pad where every floor block is at the exact same Y height and has open air above it,
-     * ensuring the broken shulker item cannot drop into a 1-block hole or get stuck on a ledge.
-     */
     private RestockPad findSafeRestockPad() {
         if (mc.player == null || mc.world == null) return null;
         BlockPos center = mc.player.getBlockPos();
@@ -1483,24 +1762,23 @@ public class MossPilot extends Module {
 
         for (int dx = -8; dx <= 8; dx++) {
             for (int dz = -8; dz <= 8; dz++) {
-                for (int dy = 2; dy >= -10; dy--) {
+                for (int dy = 2; dy >= -8; dy--) {
                     BlockPos floor = center.add(dx, dy, dz);
                     if (!isSolidDryFloor(floor)) continue;
 
                     BlockPos standPos = floor.up();
-                    if (!mc.world.getBlockState(standPos).isAir() || !mc.world.getBlockState(standPos.up()).isAir()) break;
+                    if (!isPassableAir(mc.world.getBlockState(standPos)) || !mc.world.getBlockState(standPos.up()).isAir()) break;
 
                     for (Direction dir : Direction.Type.HORIZONTAL) {
                         BlockPos boxFloor = floor.offset(dir);
                         BlockPos boxPos = boxFloor.up();
                         if (!isSolidDryFloor(boxFloor)) continue;
-                        if (!mc.world.getBlockState(boxPos).isAir() || !mc.world.getBlockState(boxPos.up()).isAir()) continue;
+                        if (!isPassableAir(mc.world.getBlockState(boxPos)) || !mc.world.getBlockState(boxPos.up()).isAir()) continue;
 
-                        // Require all 4 neighbors around boxFloor to be solid at the exact same Y height
                         boolean flatPad = true;
                         for (Direction nDir : Direction.Type.HORIZONTAL) {
                             BlockPos neighborFloor = boxFloor.offset(nDir);
-                            if (!isSolidDryFloor(neighborFloor) || !mc.world.getBlockState(neighborFloor.up()).isAir()) {
+                            if (!isSolidDryFloor(neighborFloor) || !isPassableAir(mc.world.getBlockState(neighborFloor.up()))) {
                                 flatPad = false;
                                 break;
                             }
@@ -1535,6 +1813,44 @@ public class MossPilot extends Module {
         return stageTicks > 120;
     }
 
+    private void abortRestock(int cooldown) {
+        restockCooldown = cooldown;
+        restockStage = RestockStage.TAKEOFF;
+        stageTicks = 0;
+    }
+
+    private boolean quickMoveSlot(ScreenHandler h, int slot) {
+        if (slot == -1 || mc.interactionManager == null || mc.player == null) return false;
+        mc.interactionManager.clickSlot(h.syncId, slot, 0, SlotActionType.QUICK_MOVE, mc.player);
+        clickDelay = 3;
+        return true;
+    }
+
+    private void selectNextShulkerOrTakeoff() {
+        if (needsMoss() && findShulkerInInv(Items.MOSS_BLOCK) != -1) {
+            grabMossNext = true;
+            restockStage = RestockStage.PREP_SPOT;
+            stageTicks = 0;
+        } else if (needsBone() && findShulkerInInv(Items.BONE_BLOCK, Items.BONE_MEAL) != -1) {
+            grabMossNext = false;
+            restockStage = RestockStage.PREP_SPOT;
+            stageTicks = 0;
+        } else {
+            abortRestock((needsMoss() || needsBone()) ? 300 : 0);
+        }
+    }
+
+    private void interactContainerOrFallback(BlockPos pos, RestockStage fallback) {
+        if (stageTicks % 6 == 0 && pos != null) {
+            BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(pos), Direction.UP, pos, false);
+            BlockUtils.interact(hit, Hand.MAIN_HAND, true);
+        }
+        if (stageTicks > 40) {
+            restockStage = fallback;
+            stageTicks = 0;
+        }
+    }
+
     private void tickRestock() {
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
         stageTicks++;
@@ -1544,10 +1860,8 @@ public class MossPilot extends Module {
             if (mc.player.currentScreenHandler != mc.player.playerScreenHandler) {
                 mc.player.closeHandledScreen();
             }
-            restockStage = RestockStage.TAKEOFF;
-            restockCooldown = 300;
-            stageTicks = 0;
             totalRestockTicks = 0;
+            abortRestock(300);
             return;
         }
 
@@ -1573,7 +1887,7 @@ public class MossPilot extends Module {
                 }
 
                 mc.player.setNoGravity(true);
-                double spd = Math.min(0.42, horiz);
+                double spd = Math.min(0.45, horiz);
                 double vx = horiz > 0.01 ? (dx / horiz) * spd : 0;
                 double vz = horiz > 0.01 ? (dz / horiz) * spd : 0;
                 double vy = MathHelper.clamp(dy * 0.45, -0.4, 0.45);
@@ -1584,34 +1898,53 @@ public class MossPilot extends Module {
                 mc.player.setNoGravity(false);
                 if (mc.player.isOnGround()) {
                     mc.player.setVelocity(0, 0, 0);
-                    stageTicks = 0;
-
                     dropJunkIfFull();
-
-                    int mossBox = findShulkerInInv(Items.MOSS_BLOCK);
-                    int boneBox = findShulkerInInv(Items.BONE_BLOCK, Items.BONE_MEAL);
-
-                    if (needsMoss() && mossBox != -1) {
-                        grabMossNext = true;
-                        restockStage = RestockStage.PLACE_SHULKER;
-                    } else if (needsBone() && boneBox != -1) {
-                        grabMossNext = false;
-                        restockStage = RestockStage.PLACE_SHULKER;
-                    } else if (!echestEmpty && countItem(Items.ENDER_CHEST) >= 1) {
+                    if (!echestEmpty && findShulkerInInv(Items.MOSS_BLOCK) == -1
+                        && findShulkerInInv(Items.BONE_BLOCK, Items.BONE_MEAL) == -1
+                        && countItem(Items.ENDER_CHEST) >= 1) {
                         restockStage = RestockStage.PLACE_ECHEST_1;
+                        stageTicks = 0;
                     } else {
-                        restockCooldown = 500;
-                        restockStage = RestockStage.TAKEOFF;
+                        selectNextShulkerOrTakeoff();
                     }
                     return;
                 }
 
                 mc.player.setVelocity(0, -0.35, 0);
                 if (stageTicks > 60) {
-                    restockCooldown = 160;
-                    restockStage = RestockStage.TAKEOFF;
-                    stageTicks = 0;
+                    abortRestock(160);
                 }
+            }
+
+            case PREP_SPOT -> {
+                BlockPos targetBoxPos = (restockPad != null) ? restockPad.boxPos : findPlaceSpotSameLevel(mc.player.getBlockPos());
+                if (targetBoxPos == null) {
+                    abortRestock(140);
+                    return;
+                }
+                shulkerPos = targetBoxPos;
+
+                if (!mc.world.getBlockState(shulkerPos).isAir()) {
+                    BlockUtils.breakBlock(shulkerPos, true);
+                    if (stageTicks < 10) return;
+                }
+                if (!mc.world.getBlockState(shulkerPos.up()).isAir()) {
+                    BlockUtils.breakBlock(shulkerPos.up(), true);
+                    if (stageTicks < 15) return;
+                }
+
+                Vec3d boxCenter = Vec3d.ofBottomCenter(shulkerPos);
+                double dx = mc.player.getX() - boxCenter.x;
+                double dz = mc.player.getZ() - boxCenter.z;
+                double dist = Math.sqrt(dx * dx + dz * dz);
+                if (dist < 1.15 && dist > 0.01 && stageTicks < 12) {
+                    mc.player.setVelocity((dx / dist) * 0.18, mc.player.getVelocity().y, (dz / dist) * 0.18);
+                    return;
+                }
+
+                mc.player.setVelocity(0, mc.player.getVelocity().y, 0);
+                restockStage = RestockStage.PLACE_SHULKER;
+                stageTicks = 0;
             }
 
             case PLACE_SHULKER -> {
@@ -1622,11 +1955,10 @@ public class MossPilot extends Module {
                 if (slot == -1) {
                     if (!echestEmpty && countItem(Items.ENDER_CHEST) >= 1) {
                         restockStage = RestockStage.PLACE_ECHEST_1;
+                        stageTicks = 0;
                     } else {
-                        restockCooldown = 500;
-                        restockStage = RestockStage.TAKEOFF;
+                        abortRestock(500);
                     }
-                    stageTicks = 0;
                     return;
                 }
 
@@ -1635,47 +1967,36 @@ public class MossPilot extends Module {
                     return;
                 }
 
-                BlockPos pos = (restockPad != null && BlockUtils.canPlace(restockPad.boxPos, true))
-                    ? restockPad.boxPos
-                    : findPlaceSpotSameLevel(mc.player.getBlockPos());
-
-                if (pos == null) {
-                    restockCooldown = 140;
-                    restockStage = RestockStage.TAKEOFF;
-                    stageTicks = 0;
+                if (!BlockUtils.canPlace(shulkerPos, true)) {
+                    shulkerPos = findPlaceSpotSameLevel(mc.player.getBlockPos());
+                }
+                if (shulkerPos == null) {
+                    abortRestock(140);
                     return;
                 }
 
                 prevShulkers = countAllShulkers();
                 FindItemResult item = new FindItemResult(slot, mc.player.getInventory().getStack(slot).getCount());
-                if (BlockUtils.place(pos, item, true, 50, true)) {
-                    shulkerPos = pos;
+                if (BlockUtils.place(shulkerPos, item, true, 50, true)) {
                     restockStage = RestockStage.OPEN_SHULKER;
                     stageTicks = 0;
                 } else if (stageTicks > 25) {
-                    restockCooldown = 140;
-                    restockStage = RestockStage.TAKEOFF;
-                    stageTicks = 0;
+                    abortRestock(140);
                 }
             }
 
             case OPEN_SHULKER -> {
+                mc.player.setVelocity(0, mc.player.getVelocity().y, 0);
                 if (mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler) {
                     restockStage = RestockStage.LOOT_SHULKER;
                     stageTicks = 0;
                     return;
                 }
-                if (stageTicks % 6 == 0 && shulkerPos != null) {
-                    BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(shulkerPos), Direction.UP, shulkerPos, false);
-                    BlockUtils.interact(hit, Hand.MAIN_HAND, true);
-                }
-                if (stageTicks > 40) {
-                    restockStage = RestockStage.BREAK_SHULKER;
-                    stageTicks = 0;
-                }
+                interactContainerOrFallback(shulkerPos, RestockStage.BREAK_SHULKER);
             }
 
             case LOOT_SHULKER -> {
+                mc.player.setVelocity(0, 0, 0);
                 if (!(mc.player.currentScreenHandler instanceof ShulkerBoxScreenHandler h)) {
                     restockStage = RestockStage.BREAK_SHULKER;
                     stageTicks = 0;
@@ -1686,23 +2007,13 @@ public class MossPilot extends Module {
 
                 if (getEmptySlots() > 1) {
                     if (grabMossNext) {
-                        if (countItem(Items.MOSS_BLOCK) < targetMossStacks.get() * 64) {
-                            int s = findItemInShulker(h, Items.MOSS_BLOCK);
-                            if (s != -1) {
-                                mc.interactionManager.clickSlot(h.syncId, s, 0, SlotActionType.QUICK_MOVE, mc.player);
-                                clickDelay = 3;
-                                return;
-                            }
+                        if (countItem(Items.MOSS_BLOCK) < targetMossStacks.get() * 64
+                            && quickMoveSlot(h, findItemInShulker(h, Items.MOSS_BLOCK))) {
+                            return;
                         }
-                    } else {
-                        if (countSlotsWith(Items.BONE_MEAL, Items.BONE_BLOCK) < getMaxBoneSlots()) {
-                            int s = findItemInShulker(h, Items.BONE_BLOCK, Items.BONE_MEAL);
-                            if (s != -1) {
-                                mc.interactionManager.clickSlot(h.syncId, s, 0, SlotActionType.QUICK_MOVE, mc.player);
-                                clickDelay = 3;
-                                return;
-                            }
-                        }
+                    } else if (countBoneSlots() < getMaxBoneSlots()
+                        && quickMoveSlot(h, findItemInShulker(h, Items.BONE_BLOCK, Items.BONE_MEAL))) {
+                        return;
                     }
                 }
 
@@ -1718,12 +2029,11 @@ public class MossPilot extends Module {
                     return;
                 }
 
-                // Walk flush against the shulker while mining it so the item drops inside our hitbox
                 Vec3d boxCenter = Vec3d.ofBottomCenter(shulkerPos);
                 double dx = boxCenter.x - mc.player.getX();
                 double dz = boxCenter.z - mc.player.getZ();
                 double dist = Math.sqrt(dx * dx + dz * dz);
-                if (dist > 0.65) {
+                if (dist > 0.7) {
                     mc.player.setVelocity((dx / dist) * 0.16, mc.player.getVelocity().y, (dz / dist) * 0.16);
                 }
 
@@ -1740,18 +2050,7 @@ public class MossPilot extends Module {
                 if ((countAllShulkers() >= prevShulkers && droppedShulker == null) || stageTicks > 160) {
                     mc.player.setNoGravity(false);
                     shulkerPos = null;
-                    stageTicks = 0;
-
-                    if (needsMoss() && findShulkerInInv(Items.MOSS_BLOCK) != -1) {
-                        grabMossNext = true;
-                        restockStage = RestockStage.PLACE_SHULKER;
-                    } else if (needsBone() && findShulkerInInv(Items.BONE_BLOCK, Items.BONE_MEAL) != -1) {
-                        grabMossNext = false;
-                        restockStage = RestockStage.PLACE_SHULKER;
-                    } else {
-                        if (needsMoss() || needsBone()) restockCooldown = 300;
-                        restockStage = RestockStage.TAKEOFF;
-                    }
+                    selectNextShulkerOrTakeoff();
                     return;
                 }
 
@@ -1767,7 +2066,6 @@ public class MossPilot extends Module {
                     double dz = dropPos.z - mc.player.getZ();
                     double horiz = Math.sqrt(dx * dx + dz * dz);
 
-                    // If blocked by a ledge or item is on a different Y level, engage flight/jump to magnet directly onto it
                     if (dy > 0.35 || mc.player.horizontalCollision || stageTicks > 25) {
                         if (!mc.player.isGliding() && mc.player.isOnGround()) {
                             mc.player.jump();
@@ -1787,9 +2085,7 @@ public class MossPilot extends Module {
                 FindItemResult ec = findEChest();
                 if (!ec.found()) {
                     echestEmpty = true;
-                    restockCooldown = 500;
-                    restockStage = RestockStage.TAKEOFF;
-                    stageTicks = 0;
+                    abortRestock(500);
                     return;
                 }
 
@@ -1800,22 +2096,22 @@ public class MossPilot extends Module {
                 } else {
                     BlockPos single = findPlaceSpotSameLevel(mc.player.getBlockPos());
                     if (single == null) {
-                        restockCooldown = 140;
-                        restockStage = RestockStage.TAKEOFF;
-                        stageTicks = 0;
+                        abortRestock(140);
                         return;
                     }
                     echestPos1 = single;
                     echestPos2 = null;
                 }
 
+                if (!mc.world.getBlockState(echestPos1.up()).isAir()) {
+                    BlockUtils.breakBlock(echestPos1.up(), true);
+                }
+
                 if (BlockUtils.place(echestPos1, ec, true, 50, true)) {
                     restockStage = echestPos2 != null ? RestockStage.PLACE_ECHEST_2 : RestockStage.OPEN_ECHEST;
                     stageTicks = 0;
                 } else if (stageTicks > 25) {
-                    restockCooldown = 140;
-                    restockStage = RestockStage.TAKEOFF;
-                    stageTicks = 0;
+                    abortRestock(140);
                 }
             }
 
@@ -1833,22 +2129,17 @@ public class MossPilot extends Module {
             }
 
             case OPEN_ECHEST -> {
+                mc.player.setVelocity(0, 0, 0);
                 if (mc.player.currentScreenHandler instanceof GenericContainerScreenHandler) {
                     restockStage = RestockStage.LOOT_ECHEST;
                     stageTicks = 0;
                     return;
                 }
-                if (stageTicks % 6 == 0 && echestPos1 != null) {
-                    BlockHitResult hit = new BlockHitResult(Vec3d.ofCenter(echestPos1), Direction.UP, echestPos1, false);
-                    BlockUtils.interact(hit, Hand.MAIN_HAND, true);
-                }
-                if (stageTicks > 40) {
-                    restockStage = RestockStage.BREAK_ECHEST_1;
-                    stageTicks = 0;
-                }
+                interactContainerOrFallback(echestPos1, RestockStage.BREAK_ECHEST_1);
             }
 
             case LOOT_ECHEST -> {
+                mc.player.setVelocity(0, 0, 0);
                 if (!(mc.player.currentScreenHandler instanceof GenericContainerScreenHandler h)) {
                     restockStage = RestockStage.BREAK_ECHEST_1;
                     stageTicks = 0;
@@ -1858,22 +2149,14 @@ public class MossPilot extends Module {
                 if (stageTicks < 8 || clickDelay > 0) return;
 
                 if (getEmptySlots() > 1) {
-                    if (countShulkersWith(Items.MOSS_BLOCK) < echestMossShulkers.get()) {
-                        int s = findShulkerInEChest(h, Items.MOSS_BLOCK);
-                        if (s != -1) {
-                            mc.interactionManager.clickSlot(h.syncId, s, 0, SlotActionType.QUICK_MOVE, mc.player);
-                            clickDelay = 3;
-                            return;
-                        }
+                    if (countShulkersWith(Items.MOSS_BLOCK) < echestMossShulkers.get()
+                        && quickMoveSlot(h, findShulkerInEChest(h, Items.MOSS_BLOCK))) {
+                        return;
                     }
 
-                    if (countShulkersWith(Items.BONE_BLOCK, Items.BONE_MEAL) < echestBoneShulkers.get()) {
-                        int s = findShulkerInEChest(h, Items.BONE_BLOCK, Items.BONE_MEAL);
-                        if (s != -1) {
-                            mc.interactionManager.clickSlot(h.syncId, s, 0, SlotActionType.QUICK_MOVE, mc.player);
-                            clickDelay = 3;
-                            return;
-                        }
+                    if (countShulkersWith(Items.BONE_BLOCK, Items.BONE_MEAL) < echestBoneShulkers.get()
+                        && quickMoveSlot(h, findShulkerInEChest(h, Items.BONE_BLOCK, Items.BONE_MEAL))) {
+                        return;
                     }
                 }
 
@@ -1898,17 +2181,7 @@ public class MossPilot extends Module {
             case BREAK_ECHEST_2 -> {
                 if (breakEChest(echestPos2)) {
                     echestPos2 = null;
-                    if (needsMoss() && findShulkerInInv(Items.MOSS_BLOCK) != -1) {
-                        grabMossNext = true;
-                        restockStage = RestockStage.PLACE_SHULKER;
-                    } else if (needsBone() && findShulkerInInv(Items.BONE_BLOCK, Items.BONE_MEAL) != -1) {
-                        grabMossNext = false;
-                        restockStage = RestockStage.PLACE_SHULKER;
-                    } else {
-                        restockCooldown = 300;
-                        restockStage = RestockStage.TAKEOFF;
-                    }
-                    stageTicks = 0;
+                    selectNextShulkerOrTakeoff();
                 }
             }
 
@@ -2027,16 +2300,13 @@ public class MossPilot extends Module {
         return count;
     }
 
-    private int countSlotsWith(Item... items) {
+    private int countBoneSlots() {
         if (mc.player == null) return 0;
         int slots = 0;
         for (int i = 0; i < 36; i++) {
             ItemStack s = mc.player.getInventory().getStack(i);
-            for (Item item : items) {
-                if (s.isOf(item)) {
-                    slots++;
-                    break;
-                }
+            if (s.isOf(Items.BONE_MEAL) || s.isOf(Items.BONE_BLOCK)) {
+                slots++;
             }
         }
         return slots;
@@ -2072,12 +2342,14 @@ public class MossPilot extends Module {
 
     private BlockPos findPlaceSpotSameLevel(BlockPos center) {
         if (mc.world == null) return null;
-        for (Direction dir : Direction.Type.HORIZONTAL) {
-            BlockPos p = center.offset(dir, 1);
-            if (BlockUtils.canPlace(p, true)
-                && isSolidDryFloor(p.down())
-                && mc.world.getBlockState(p.up()).isAir()) {
-                return p.toImmutable();
+        for (int dist = 1; dist <= 2; dist++) {
+            for (Direction dir : Direction.Type.HORIZONTAL) {
+                BlockPos p = center.offset(dir, dist);
+                if (isSolidDryFloor(p.down())
+                    && isPassableAir(mc.world.getBlockState(p))
+                    && isPassableAir(mc.world.getBlockState(p.up()))) {
+                    return p.toImmutable();
+                }
             }
         }
         return null;
@@ -2099,6 +2371,8 @@ public class MossPilot extends Module {
         return null;
     }
 
+    private record LocalWorkInfo(int convertible, int frontier) {}
+    private record PatchStats(int frontier, int convertible, int fluid, int avgY) {}
     private record SectorInfo(double x, int y, double z, int convertible, int frontier) {}
     private record RestockPad(BlockPos standPos, BlockPos boxPos) {}
 }
